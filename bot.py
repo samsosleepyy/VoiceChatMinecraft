@@ -18,14 +18,15 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASS", "admin1234") 
 LOG_WEBHOOK_URL = os.getenv("LOG_WEBHOOK_URL", "") 
 
-# 🔴 ใส่ลิงก์ Database ของคุณตรงนี้ (ดูได้จากหน้า Console Firebase)
-FIREBASE_DB_URL = "https://vcdata-2212b-default-rtdb.asia-southeast1.firebasedatabase.app/"  # <-- แก้ตรงนี้ถ้าลิงก์ไม่ตรง
+# 🔴 ลองเปลี่ยน URL ตรงนี้ดูครับ (ถ้าต่อไม่ติด ลองเปลี่ยนเป็น .firebaseio.com)
+# แบบ 1 (US/Default): "https://vcdata-2212b-default-rtdb.firebaseio.com/"
+# แบบ 2 (Asia): "https://vcdata-2212b-default-rtdb.asia-southeast1.firebasedatabase.app/"
+FIREBASE_DB_URL = "https://vcdata-2212b-default-rtdb.asia-southeast1.firebasedatabase.app/"
 
 DEFAULT_RANGE = 10
 MOVE_COOLDOWN = 3.0
 
-# --- FIREBASE CREDENTIALS (HARDCODED) ---
-# ข้อมูลจากไฟล์ vcdata-2212b-firebase-adminsdk-fbsvc-95334a89b1.json
+# --- FIREBASE CREDENTIALS (จากไฟล์ที่คุณให้มา) ---
 FIREBASE_CREDENTIALS = {
   "type": "service_account",
   "project_id": "vcdata-2212b",
@@ -43,88 +44,70 @@ FIREBASE_CREDENTIALS = {
 # --- FIREBASE SETUP ---
 if not firebase_admin._apps:
     try:
-        # ใช้ Dictionary โดยตรง ไม่ต้องโหลด JSON
         cred = credentials.Certificate(FIREBASE_CREDENTIALS)
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': FIREBASE_DB_URL
-        })
-        print("🔥 Firebase Connected (Direct Credentials)!")
+        firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_DB_URL})
+        print("🔥 Firebase Connected Successfully!")
     except Exception as e:
-        print(f"❌ Firebase Error: {e}")
-        # ไม่สั่งปิดโปรแกรมเพื่อให้ Web Server ยังทำงานได้แม้ Firebase พัง
-        pass
+        print(f"❌ Firebase Connection Failed: {e}")
+        # บอทจะทำงานต่อโดยใช้ Memory ชั่วคราว (แต่ถ้า Restart ข้อมูลจะหาย)
 
 # --- DATA CACHING ---
-# References
 try:
     ref_whitelist = db.reference('whitelist')
     ref_users = db.reference('users')
     ref_config = db.reference('server_config')
-
-    # Load Initial Data (ถ้าต่อไม่ได้ให้เป็น Dict ว่างไว้ก่อน)
+    
+    # Test Connection
+    print("📡 Testing Database Connection...")
     whitelist_data = ref_whitelist.get() or {}
     users_data = ref_users.get() or {} 
     server_config_data = ref_config.get() or {}
-except:
+    print(f"✅ Database Loaded! Found {len(whitelist_data)} Whitelisted Servers")
+except Exception as e:
+    print(f"⚠️ DATABASE ERROR: {e}")
+    print("⚠️ Running in Offline Mode (Memory Only)")
     whitelist_data = {}
     users_data = {}
     server_config_data = {}
-    print("⚠️ Warning: Running in Offline Mode (Firebase Init Failed)")
 
 # Helper Dicts
 user_links = {int(k): v.get('gamertag') for k, v in users_data.items()} if users_data else {}
 user_last_move = {}
 game_state = {}
 
-# --- HELPER FUNCTIONS FOR DB ---
+# --- HELPER FUNCTIONS ---
 def db_add_whitelist(guild_id, name, active=True):
-    try:
-        gid = str(guild_id)
-        whitelist_data[gid] = {"active": active, "name": name}
-        ref_whitelist.child(gid).set(whitelist_data[gid])
+    gid = str(guild_id)
+    whitelist_data[gid] = {"active": active, "name": name} # Update Memory
+    try: ref_whitelist.child(gid).set(whitelist_data[gid]) # Update DB
     except: pass
 
 def db_remove_whitelist(guild_id):
-    try:
-        gid = str(guild_id)
-        if gid in whitelist_data:
-            del whitelist_data[gid]
-            ref_whitelist.child(gid).delete()
+    gid = str(guild_id)
+    if gid in whitelist_data: del whitelist_data[gid]
+    try: ref_whitelist.child(gid).delete()
     except: pass
 
 def db_toggle_whitelist(guild_id):
-    try:
-        gid = str(guild_id)
-        if gid in whitelist_data:
-            new_status = not whitelist_data[gid]['active']
-            whitelist_data[gid]['active'] = new_status
-            ref_whitelist.child(gid).update({'active': new_status})
-    except: pass
+    gid = str(guild_id)
+    if gid in whitelist_data:
+        whitelist_data[gid]['active'] = not whitelist_data[gid]['active']
+        try: ref_whitelist.child(gid).update({'active': whitelist_data[gid]['active']})
+        except: pass
 
 def db_save_user(discord_id, gamertag, guild_id):
-    try:
-        uid = str(discord_id)
-        user_links[int(discord_id)] = gamertag
-        new_data = {
-            'gamertag': gamertag,
-            'source_guild': str(guild_id),
-            'timestamp': time.time()
-        }
-        users_data[uid] = new_data
-        ref_users.child(uid).set(new_data)
+    uid = str(discord_id)
+    user_links[int(discord_id)] = gamertag
+    new_data = {'gamertag': gamertag, 'source_guild': str(guild_id), 'timestamp': time.time()}
+    try: ref_users.child(uid).set(new_data)
     except: pass
 
 def db_save_config(guild_id, category_id, start_channel_id, range_val=10):
-    try:
-        gid = str(guild_id)
-        cfg = {
-            'category_id': category_id,
-            'start_channel_id': start_channel_id,
-            'range': range_val
-        }
-        if gid not in server_config_data: server_config_data[gid] = {}
-        server_config_data[gid] = cfg
-        ref_config.child(gid).set(cfg)
+    gid = str(guild_id)
+    cfg = {'category_id': category_id, 'start_channel_id': start_channel_id, 'range': range_val}
+    if gid not in server_config_data: server_config_data[gid] = {}
+    server_config_data[gid] = cfg
+    try: ref_config.child(gid).set(cfg)
     except: pass
 
 # --- BOT SETUP ---
@@ -154,14 +137,12 @@ class MyBot(commands.Bot):
         self.web_server = web.TCPSite(runner, '0.0.0.0', port)
         await self.web_server.start()
         print(f"✅ Web Server running on port {port}")
-        try:
-            await self.tree.sync()
-            print("✅ Slash Commands Synced")
+        try: await self.tree.sync()
         except: pass
 
     async def handle_index(self, request):
         status = "Sleeping (Rate Limit)" if self.is_rate_limited else "Online"
-        return web.Response(text=f"Bot Status: {status} | Whitelist: {len(whitelist_data)}")
+        return web.Response(text=f"Bot Status: {status} | Config Loaded: {len(server_config_data)}")
 
     async def handle_dashboard(self, request):
         try:
@@ -194,21 +175,26 @@ class MyBot(commands.Bot):
 
     async def handle_coords(self, request):
         try:
+            # 🔍 DEBUG LOG: ดูว่าข้อมูลเข้ามาไหม
             data = await request.json()
+            print(f"📥 Received data for {len(data)} players") 
+            
             global game_state
-            # Update Game State
             current = {}
             for p in data: current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
             
-            # Send Verified Names (Always)
             verified = list(user_links.values())
             
             if not self.is_rate_limited:
+                # 🔍 DEBUG LOG: เช็คว่า Config ว่างไหม
+                if not server_config_data:
+                    print("⚠️ Warning: Server Config is Empty! (Run /setup again?)")
                 await process_voice_logic()
             
             return web.json_response({'status': 'ok', 'verified': verified})
-        except:
+        except Exception as e:
+            print(f"❌ API Error: {e}")
             return web.json_response({'status': 'error'}, status=500)
 
 bot = MyBot()
@@ -217,40 +203,34 @@ bot = MyBot()
 async def on_guild_join(guild):
     gid = str(guild.id)
     if gid not in whitelist_data:
-        # Not Whitelisted
         if LOG_WEBHOOK_URL:
             async with ClientSession() as session:
                 webhook = Webhook.from_url(LOG_WEBHOOK_URL, session=session)
                 try: inv = await guild.text_channels[0].create_invite()
                 except: inv = "None"
-                await webhook.send(f"🚨 Unauthorized: {guild.name} ({guild.id}) - {inv}", username="Security")
+                await webhook.send(f"🚨 Unauthorized: {guild.name} ({guild.id})", username="Security")
         try:
             for ch in random.sample(guild.text_channels, min(len(guild.text_channels),3)):
                 await ch.send("🚫 Not Whitelisted: https://discord.gg/FnmWw7nWyq")
         except: pass
         await guild.leave()
     else:
-        # Update Name in DB
         db_add_whitelist(gid, guild.name, whitelist_data[gid]['active'])
 
-# --- UI ---
 class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
     xbox_name = ui.TextInput(label='Xbox Gamertag')
     async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
         gamertag = self.xbox_name.value.strip()
-        # Save to Firebase
         db_save_user(interaction.user.id, gamertag, interaction.guild_id)
         
-        # Get Config
         gid = str(interaction.guild_id)
         msg = f"✅ Saved **{gamertag}**"
-        
         if gid in server_config_data:
             chan_id = server_config_data[gid].get('start_channel_id')
             chan = interaction.guild.get_channel(chan_id)
             if chan: msg += f"\n👉 Go to {chan.mention}"
-            
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
 
 class SetupView(ui.View):
     def __init__(self): super().__init__(timeout=None)
@@ -259,21 +239,17 @@ class SetupView(ui.View):
     @ui.button(label="Edit Name", style=discord.ButtonStyle.gray, custom_id="mc_edit")
     async def edit(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(LinkModal())
 
-# --- COMMANDS ---
 @bot.tree.command(name="setup")
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
-    await interaction.response.defer(ephemeral=True)
+    if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
     if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
     
-    # Save Whitelist
     db_add_whitelist(interaction.guild_id, interaction.guild.name)
-    
-    # Save Config to Firebase
     db_save_config(interaction.guild_id, category.id, start_channel.id, server_config_data.get(str(interaction.guild_id), {}).get('range', DEFAULT_RANGE))
 
     msg = "✅ Setup Complete!"
     if role:
-        await interaction.followup.send(f"⏳ Setting permissions for {role.mention}...", ephemeral=True)
+        await interaction.followup.send(f"⏳ Setting permissions...", ephemeral=True)
         try:
             for c in category.channels:
                 if c.id == start_channel.id: await c.set_permissions(role, view_channel=True, connect=True)
@@ -285,7 +261,6 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
         await interaction.edit_original_response(content=msg)
     else:
         await interaction.followup.send(msg, ephemeral=True)
-
     await interaction.channel.send(embed=discord.Embed(title="Voice Chat", description="Click to Connect", color=0x2ecc71), view=SetupView())
 
 @bot.tree.command(name="whitelist")
@@ -307,9 +282,7 @@ async def set_range(i: discord.Interaction, distance: int):
     db_save_config(i.guild_id, cfg.get('category_id'), cfg.get('start_channel_id'), distance)
     await i.response.send_message(f"🔊 Range set to {distance}", ephemeral=True)
 
-# --- LOGIC ---
 async def process_voice_logic():
-    # Cleanup Cooldowns
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
 
@@ -344,7 +317,6 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
-        # Clustering
         groups = []
         processed = set()
         for i in range(len(online)):
@@ -360,7 +332,6 @@ async def process_voice_logic():
                     processed.add(j)
             groups.append(grp)
             
-        # Moving
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
         taken = set()
         
