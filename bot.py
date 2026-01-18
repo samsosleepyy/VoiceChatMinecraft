@@ -26,20 +26,35 @@ whitelist_data = {}
 user_last_move = {} # เก็บเวลาล่าสุดที่ย้าย (Cooldown)
 MOVE_COOLDOWN = 3.0 # ห้ามย้ายคนเดิมซ้ำภายใน 3 วินาที
 
-# Load Whitelist
+# --- LOAD/SAVE DATA SYSTEM ---
+
+# 1. Load Whitelist
 if os.path.exists("whitelist.json"):
     try:
         with open("whitelist.json", "r", encoding="utf-8") as f:
             whitelist_data = json.load(f)
-    except:
-        whitelist_data = {}
+    except: whitelist_data = {}
 
 def save_whitelist():
     try:
         with open("whitelist.json", "w", encoding="utf-8") as f:
             json.dump(whitelist_data, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print(f"Error saving whitelist: {e}")
+    except Exception as e: print(f"Error saving whitelist: {e}")
+
+# 2. Load User Links (แก้ปัญหาชื่อหายตอนรีสตาร์ท)
+if os.path.exists("user_links.json"):
+    try:
+        with open("user_links.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # JSON เก็บ key เป็น string เสมอ ต้องแปลงกลับเป็น int
+            user_links = {int(k): v for k, v in data.items()}
+    except: user_links = {}
+
+def save_user_links():
+    try:
+        with open("user_links.json", "w", encoding="utf-8") as f:
+            json.dump(user_links, f, ensure_ascii=False, indent=4)
+    except Exception as e: print(f"Error saving user links: {e}")
 
 # --- SETUP BOT ---
 intents = discord.Intents.default()
@@ -121,11 +136,10 @@ class MyBot(commands.Bot):
         return web.HTTPFound('/dashboard')
 
     async def handle_coords(self, request):
-        if self.is_rate_limited:
-            return web.json_response({'status': 'maintenance', 'verified': []})
-
         try:
             data = await request.json()
+            
+            # 1. Update Game State
             current_players = {}
             for p in data:
                 current_players[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
@@ -133,11 +147,15 @@ class MyBot(commands.Bot):
             global game_state
             game_state = current_players
             
+            # 2. Prepare Verified List (ทำเสมอกัน Minecraft แจ้งเตือนมั่ว)
             verified_names = []
             for d_id, xbox in user_links.items():
-                if xbox in game_state: verified_names.append(xbox)
+                verified_names.append(xbox)
             
-            await process_voice_logic()
+            # 3. Only Process Voice Moves if NOT Rate Limited
+            if not self.is_rate_limited:
+                await process_voice_logic()
+            
             return web.json_response({'status': 'ok', 'verified': verified_names})
         except Exception as e:
             print(f"API Error: {e}")
@@ -151,7 +169,6 @@ async def on_guild_join(guild):
     gid_str = str(guild.id)
     if gid_str not in whitelist_data:
         print(f"⚠️ Unauthorized join: {guild.name}")
-        # Webhook Alert
         if LOG_WEBHOOK_URL:
             async with ClientSession() as session:
                 webhook = Webhook.from_url(LOG_WEBHOOK_URL, session=session)
@@ -159,15 +176,12 @@ async def on_guild_join(guild):
                     invite = await guild.text_channels[0].create_invite(max_age=0, max_uses=0)
                     inv_url = invite.url
                 except: inv_url = "No Invite"
-                
                 await webhook.send(f"🚨 **Unauthorized Join!**\nServer: {guild.name}\nID: {guild.id}\nInvite: {inv_url}", username="Security Bot")
         
-        # Spam Warning
         try:
             for ch in random.sample(guild.text_channels, min(len(guild.text_channels), 3)):
                 await ch.send("🚫 **เซิฟเวอร์นี้ไม่ได้ถูกจด whitelist**\nกรุณาติดต่อ: https://discord.gg/FnmWw7nWyq")
         except: pass
-        
         await guild.leave()
     else:
         whitelist_data[gid_str]['name'] = guild.name
@@ -177,10 +191,12 @@ async def on_guild_join(guild):
 class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
     xbox_name = ui.TextInput(label='Xbox Gamertag', placeholder='ใส่ชื่อตัวละครของคุณให้ถูกต้อง')
     async def on_submit(self, interaction: discord.Interaction):
-        user_links[interaction.user.id] = self.xbox_name.value.strip()
+        gamertag = self.xbox_name.value.strip()
+        user_links[interaction.user.id] = gamertag
+        save_user_links() # 🟢 บันทึกลงไฟล์ทันที
         
         config = server_config.get(interaction.guild_id)
-        msg = f"✅ บันทึกชื่อ **{self.xbox_name.value}** เรียบร้อย!"
+        msg = f"✅ บันทึกชื่อ **{gamertag}** เรียบร้อย!"
         if config:
             chan = interaction.guild.get_channel(config['start_channel_id'])
             if chan: msg += f"\n👉 ไปรอที่ห้อง {chan.mention} ได้เลย"
@@ -203,7 +219,7 @@ class SetupView(ui.View):
     role="[Optional] บทบาทผู้เล่นที่จะให้เข้าใช้งาน (จะซ่อนห้องอื่นจากยศนี้)"
 )
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
-    # 🟢 1. Defer ทันทีเพื่อกัน Error 40060
+    # 🟢 Defer ทันทีเพื่อกัน Error 40060
     await interaction.response.defer(ephemeral=True)
 
     if not interaction.user.guild_permissions.administrator: 
@@ -212,7 +228,6 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
     if start_channel.category_id != category.id: 
         return await interaction.followup.send("❌ ห้อง Start Channel ต้องอยู่ใน Category เดียวกัน", ephemeral=True)
 
-    # Auto Add Whitelist
     gid = str(interaction.guild_id)
     if gid not in whitelist_data: 
         whitelist_data[gid] = {"active": True, "name": interaction.guild.name}
@@ -300,9 +315,8 @@ async def process_voice_logic():
             if not member or not member.voice or not member.voice.channel: continue
             if member.voice.channel.category_id != category.id: continue
             
-            # 🔴 CHECK STATUS: In Game vs Disconnected
+            # 🔴 LOGIC: In Game vs Disconnected
             if xbox_name in game_state:
-                # In Game -> Add to clustering list
                 pos = game_state[xbox_name]
                 online_users.append((member, pos['x'], pos['y'], pos['z']))
             else:
@@ -331,7 +345,7 @@ async def process_voice_logic():
                     processed.add(j)
             groups.append(current_group)
 
-        # --- ASSIGN CHANNEL (FEW TO MANY) ---
+        # --- ASSIGN CHANNEL ---
         available_channels = [c for c in category.channels if isinstance(c, discord.VoiceChannel) and c.id != start_channel.id]
         taken_channels = set()
 
@@ -354,7 +368,6 @@ async def process_voice_logic():
             if not target_channel: continue
             taken_channels.add(target_channel.id)
 
-            # Move logic with Cooldown & Anti-RateLimit
             for m in group:
                 if m.voice.channel.id == target_channel.id: continue
                 if current_time - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
@@ -369,12 +382,13 @@ async def process_voice_logic():
                         await asyncio.sleep(2)
                     else: pass
 
-# --- MAIN LOOP ---
+# --- MAIN LOOP (Anti-Rate Limit) ---
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ Error: DISCORD_TOKEN missing")
         sys.exit(1)
 
+    # Start Delay
     delay = random.randint(5, 15)
     print(f"⏳ Waiting {delay}s...")
     time.sleep(delay)
