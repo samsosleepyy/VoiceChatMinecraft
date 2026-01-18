@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Bot Control Panel</title>
+    <style>
+        /* ... (CSS เดิมของคุณ) ... */
+        body { font-family: sans-serif; background: #1e1e2e; color: #fff; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .card { background: #313244; padding: 15px; margin-bottom: 10px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }
+        .status-on { color: #a6e3a1; font-weight: bold; }
+        .status-off { color: #f38ba8; font-weight: bold; }
+        button { cursor: pointer; padding: 8px 15px; border: none; border-radius: 4px; font-weight: bold; }
+        .btn-toggle { background: #89b4fa; color: #1e1e2e; }
+        .btn-del { background: #f38ba8; color: #1e1e2e; }
+        .btn-add { background: #a6e3a1; color: #1e1e2e; width: 100%; margin-top: 10px; }
+        input { padding: 8px; border-radius: 4px; border: none; width: 70%; }
+        h2 { border-bottom: 2px solid #45475a; padding-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎛️ Minecraft Voice Bot Dashboard</h1>
+        
+        <h2>➕ Add Whitelist</h2>
+        <form action="/dashboard/add" method="post" style="background:#313244; padding:15px; border-radius:8px;">
+            <input type="text" name="guild_id" placeholder="Server ID" required>
+            <input type="password" name="password" placeholder="Admin Password" required>
+            <button type="submit" class="btn-add">Add Server</button>
+        </form>
+
+        <h2>📋 Whitelisted Servers</h2>
+        {% for gid, data in whitelist.items() %}
+        <div class="card">
+            <div>
+                <strong>{{ data.name }}</strong> (ID: {{ gid }})<br>
+                Status: <span class="{{ 'status-on' if data.active else 'status-off' }}">{{ 'WORKING' if data.active else 'STOPPED' }}</span>
+            </div>
+            <div>
+                <form action="/dashboard/toggle" method="post" style="display:inline;">
+                    <input type="hidden" name="guild_id" value="{{ gid }}">
+                    <input type="hidden" name="password" value="{{ password }}">
+                    <button type="submit" class="btn-toggle">{{ 'Turn OFF' if data.active else 'Turn ON' }}</button>
+                </form>
+                <form action="/dashboard/remove" method="post" style="display:inline;">
+                    <input type="hidden" name="guild_id" value="{{ gid }}">
+                    <input type="hidden" name="password" value="{{ password }}">
+                    <button type="submit" class="btn-del">Delete</button>
+                </form>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</body>
+</html>
