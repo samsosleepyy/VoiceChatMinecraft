@@ -19,7 +19,7 @@ DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASS", "admin1234")
 LOG_WEBHOOK_URL = os.getenv("LOG_WEBHOOK_URL", "") 
 
 # 🔴 ใส่ลิงก์ Database ของคุณตรงนี้ (ดูได้จากหน้า Console Firebase)
-FIREBASE_DB_URL = "https://vcdata-2212b-default-rtdb.firebaseio.com/"  # <-- แก้ตรงนี้ถ้าลิงก์ไม่ตรง
+FIREBASE_DB_URL = "https://vcdata-2212b-default-rtdb.asia-southeast1.firebasedatabase.app/"  # <-- แก้ตรงนี้ถ้าลิงก์ไม่ตรง
 
 DEFAULT_RANGE = 10
 MOVE_COOLDOWN = 3.0
