@@ -1,3 +1,4 @@
 discord.py
 aiohttp
 jinja2
+firebase-admin
