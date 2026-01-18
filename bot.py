@@ -23,8 +23,8 @@ user_links = {}
 range_config = {}
 game_state = {}
 whitelist_data = {}
-user_last_move = {} # เก็บ Cooldown การย้าย
-MOVE_COOLDOWN = 3.0 # วินาที
+user_last_move = {} # เก็บเวลาล่าสุดที่ย้าย (Cooldown)
+MOVE_COOLDOWN = 3.0 # ห้ามย้ายคนเดิมซ้ำภายใน 3 วินาที
 
 # Load Whitelist
 if os.path.exists("whitelist.json"):
@@ -183,7 +183,7 @@ class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
         msg = f"✅ บันทึกชื่อ **{self.xbox_name.value}** เรียบร้อย!"
         if config:
             chan = interaction.guild.get_channel(config['start_channel_id'])
-            if chan: msg += f"\nไปรอที่ห้อง {chan.mention} ได้เลย"
+            if chan: msg += f"\n👉 ไปรอที่ห้อง {chan.mention} ได้เลย"
         
         await interaction.response.send_message(msg, ephemeral=True)
 
@@ -203,11 +203,14 @@ class SetupView(ui.View):
     role="[Optional] บทบาทผู้เล่นที่จะให้เข้าใช้งาน (จะซ่อนห้องอื่นจากยศนี้)"
 )
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
+    # 🟢 1. Defer ทันทีเพื่อกัน Error 40060
+    await interaction.response.defer(ephemeral=True)
+
     if not interaction.user.guild_permissions.administrator: 
-        return await interaction.response.send_message("❌ คุณต้องเป็น Admin เพื่อใช้คำสั่งนี้", ephemeral=True)
+        return await interaction.followup.send("❌ คุณต้องเป็น Admin เพื่อใช้คำสั่งนี้", ephemeral=True)
     
     if start_channel.category_id != category.id: 
-        return await interaction.response.send_message("❌ ห้อง Start Channel ต้องอยู่ใน Category เดียวกัน", ephemeral=True)
+        return await interaction.followup.send("❌ ห้อง Start Channel ต้องอยู่ใน Category เดียวกัน", ephemeral=True)
 
     # Auto Add Whitelist
     gid = str(interaction.guild_id)
@@ -220,34 +223,27 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
 
     msg_response = "✅ **ตั้งค่าระบบเสร็จสิ้น!**"
 
-    # --- 🔴 PERMISSION LOGIC ---
+    # --- PERMISSION LOGIC ---
     if role:
-        await interaction.response.defer(ephemeral=True) # การแก้สิทธิ์อาจใช้เวลานาน
-        msg_response += f"\n🔒 กำลังตั้งค่าสิทธิ์สำหรับบทบาท {role.mention}..."
-        
+        await interaction.followup.send(f"⏳ กำลังตั้งค่าสิทธิ์สำหรับบทบาท {role.mention}...", ephemeral=True)
         try:
-            # 1. วนลูปทุกห้องใน Category
             for channel in category.channels:
                 if channel.id == start_channel.id:
-                    # เปิดการมองเห็นห้อง Start
                     await channel.set_permissions(role, view_channel=True, connect=True)
                 else:
-                    # ปิดการมองเห็นห้องอื่นในหมวดหมู่นั้น
                     await channel.set_permissions(role, view_channel=False)
             
-            # 2. เปิดการมองเห็นห้องที่พิมพ์คำสั่ง (เพื่อให้กดปุ่มได้)
             if isinstance(interaction.channel, discord.TextChannel):
                  await interaction.channel.set_permissions(role, view_channel=True, read_messages=True)
             
-            msg_response += "\n✨ อัปเดตสิทธิ์เรียบร้อย: ผู้เล่นจะเห็นแค่ห้อง Lobby และห้องนี้เท่านั้น"
+            msg_response += "\n✨ อัปเดตสิทธิ์เรียบร้อย: ผู้เล่นจะเห็นแค่ห้อง Lobby และห้องนี้"
         except Exception as e:
-            msg_response += f"\n⚠️ เกิดข้อผิดพลาดในการตั้งสิทธิ์: {e}"
+            msg_response += f"\n⚠️ ผิดพลาดในการตั้งสิทธิ์: {e}"
             
-        await interaction.followup.send(msg_response, ephemeral=True)
+        await interaction.edit_original_response(content=msg_response)
     else:
-        await interaction.response.send_message(msg_response, ephemeral=True)
+        await interaction.followup.send(msg_response, ephemeral=True)
 
-    # Send Embed UI
     embed = discord.Embed(
         title="Voice Chat Minecraft PE", 
         description="**ระบบ Proximity Chat**\nกดปุ่มสีเขียวด้านล่างเพื่อยืนยันตัวตน",
@@ -277,9 +273,9 @@ async def set_range(i: discord.Interaction, distance: int):
     range_config[i.guild_id] = distance
     await i.response.send_message(f"🔊 Set range to {distance}", ephemeral=True)
 
-# --- CORE LOGIC (Smart Move & Anti-Limit & Auto-Lobby) ---
+# --- CORE LOGIC ---
 async def process_voice_logic():
-    # Clear old cooldowns
+    # Cleanup Cooldown
     current_time = time.time()
     to_remove = [uid for uid, t in user_last_move.items() if current_time - t > 60]
     for uid in to_remove: del user_last_move[uid]
@@ -304,13 +300,13 @@ async def process_voice_logic():
             if not member or not member.voice or not member.voice.channel: continue
             if member.voice.channel.category_id != category.id: continue
             
-            # --- 🔴 DISCONNECT HANDLING 🔴 ---
+            # 🔴 CHECK STATUS: In Game vs Disconnected
             if xbox_name in game_state:
-                # อยู่ในเกม
+                # In Game -> Add to clustering list
                 pos = game_state[xbox_name]
                 online_users.append((member, pos['x'], pos['y'], pos['z']))
             else:
-                # หลุดจากเกม -> ดีดกลับ Lobby
+                # Disconnected -> Move to Lobby
                 if member.voice.channel.id != start_channel.id:
                     if current_time - user_last_move.get(member.id, 0) > MOVE_COOLDOWN:
                         try:
@@ -319,7 +315,7 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
 
-        # --- CLUSTERING & MOVING ---
+        # --- CLUSTERING ---
         groups = []
         processed = set()
         for i in range(len(online_users)):
@@ -335,6 +331,7 @@ async def process_voice_logic():
                     processed.add(j)
             groups.append(current_group)
 
+        # --- ASSIGN CHANNEL (FEW TO MANY) ---
         available_channels = [c for c in category.channels if isinstance(c, discord.VoiceChannel) and c.id != start_channel.id]
         taken_channels = set()
 
@@ -357,6 +354,7 @@ async def process_voice_logic():
             if not target_channel: continue
             taken_channels.add(target_channel.id)
 
+            # Move logic with Cooldown & Anti-RateLimit
             for m in group:
                 if m.voice.channel.id == target_channel.id: continue
                 if current_time - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
@@ -371,13 +369,12 @@ async def process_voice_logic():
                         await asyncio.sleep(2)
                     else: pass
 
-# --- MAIN LOOP (ANTI-RATE LIMIT) ---
+# --- MAIN LOOP ---
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ Error: DISCORD_TOKEN missing")
         sys.exit(1)
 
-    # Start Delay
     delay = random.randint(5, 15)
     print(f"⏳ Waiting {delay}s...")
     time.sleep(delay)
