@@ -17,17 +17,19 @@ from firebase_admin import credentials, db
 TOKEN = os.getenv("DISCORD_TOKEN")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASS", "admin1234") 
 LOG_WEBHOOK_URL = os.getenv("LOG_WEBHOOK_URL", "") 
-# ลิงก์ Database ของคุณ
 FIREBASE_DB_URL = "https://vcdata-2212b-default-rtdb.asia-southeast1.firebasedatabase.app/"
 DEFAULT_RANGE = 10
 MOVE_COOLDOWN = 3.0
 
-# --- DATA STORES (In-Memory) ---
-server_data = {}  # { guild_id: { 'whitelist': {}, 'config': {}, 'users': {uid: gamertag} } }
-game_state = {}   # { gamertag: {x, y, z} } (Global)
+# --- DATA STORES (In-Memory Cache) ---
+server_config = {}
+user_links = {}
+range_config = {}
+game_state = {}
+whitelist_data = {}
 user_last_move = {}
 
-# --- FIREBASE CREDENTIALS (HARDCODED) ---
+# --- FIREBASE CREDENTIALS ---
 FIREBASE_CREDENTIALS = {
   "type": "service_account",
   "project_id": "vcdata-2212b",
@@ -48,64 +50,80 @@ try:
         cred = credentials.Certificate(FIREBASE_CREDENTIALS)
         firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_DB_URL})
     
-    # Root Reference: servers
-    ref_servers = db.reference('servers')
+    # DB Refs
+    ref_whitelist = db.reference('whitelist')
+    ref_users = db.reference('users')
+    ref_config = db.reference('server_config')
     
+    # Load Data to Memory (Sync)
     print("📡 Loading data from Firebase...")
-    raw_data = ref_servers.get() or {}
+    whitelist_data = ref_whitelist.get() or {}
+    users_data_raw = ref_users.get() or {}
+    server_config_raw = ref_config.get() or {}
     
-    # Parse Data to Memory
-    for gid_str, data in raw_data.items():
-        gid = int(gid_str)
-        server_data[gid] = {
-            'whitelist': data.get('whitelist', {'active': False, 'name': 'Unknown'}),
-            'config': data.get('config', {}),
-            'users': {int(uid): tag for uid, tag in data.get('users', {}).items()}
+    # Transform Data for Memory
+    user_links = {int(k): v.get('gamertag') for k, v in users_data_raw.items()}
+    server_config = {}
+    range_config = {}
+    
+    for gid, cfg in server_config_raw.items():
+        server_config[int(gid)] = {
+            'category_id': cfg.get('category_id'),
+            'start_channel_id': cfg.get('start_channel_id')
         }
+        range_config[int(gid)] = cfg.get('range', DEFAULT_RANGE)
         
-    print(f"✅ Loaded Data for {len(server_data)} Servers")
+    print(f"✅ Loaded: {len(whitelist_data)} Whitelists, {len(user_links)} Users")
 
 except Exception as e:
-    print(f"⚠️ Firebase Init Error: {e}")
+    print(f"⚠️ Firebase Error: {e}")
+    # Fallback to empty if failed
+    whitelist_data = {}
+    user_links = {}
+    server_config = {}
+    range_config = {}
 
-# --- HELPER FUNCTIONS (Scoped by Guild ID) ---
-def get_guild_data(guild_id):
-    if guild_id not in server_data:
-        server_data[guild_id] = {'whitelist': {}, 'config': {}, 'users': {}}
-    return server_data[guild_id]
+# --- HELPER FUNCTIONS (Sync to Firebase) ---
+def db_save_user(user_id, gamertag, guild_id):
+    user_links[user_id] = gamertag # Memory
+    try:
+        ref_users.child(str(user_id)).set({
+            'gamertag': gamertag,
+            'source_guild': str(guild_id),
+            'timestamp': time.time()
+        })
+    except: pass
 
-def db_save_whitelist(guild_id, name, active=True):
-    data = get_guild_data(guild_id)
-    data['whitelist'] = {'active': active, 'name': name}
-    try: ref_servers.child(str(guild_id)).child('whitelist').set(data['whitelist'])
+def db_save_config(guild_id, category_id, start_channel_id, range_val):
+    server_config[guild_id] = {'category_id': category_id, 'start_channel_id': start_channel_id} # Memory
+    range_config[guild_id] = range_val
+    try:
+        ref_config.child(str(guild_id)).set({
+            'category_id': category_id,
+            'start_channel_id': start_channel_id,
+            'range': range_val
+        })
+    except: pass
+
+def db_add_whitelist(guild_id, name):
+    gid = str(guild_id)
+    whitelist_data[gid] = {'active': True, 'name': name} # Memory
+    try: ref_whitelist.child(gid).set(whitelist_data[gid])
     except: pass
 
 def db_remove_whitelist(guild_id):
-    if guild_id in server_data:
-        del server_data[guild_id]['whitelist']
-        try: ref_servers.child(str(guild_id)).child('whitelist').delete()
-        except: pass
+    gid = str(guild_id)
+    if gid in whitelist_data: del whitelist_data[gid] # Memory
+    try: ref_whitelist.child(gid).delete()
+    except: pass
 
 def db_toggle_whitelist(guild_id):
-    data = get_guild_data(guild_id)
-    if data['whitelist']:
-        new_stat = not data['whitelist'].get('active', False)
-        data['whitelist']['active'] = new_stat
-        try: ref_servers.child(str(guild_id)).child('whitelist').update({'active': new_stat})
+    gid = str(guild_id)
+    if gid in whitelist_data:
+        new_stat = not whitelist_data[gid]['active']
+        whitelist_data[gid]['active'] = new_stat
+        try: ref_whitelist.child(gid).update({'active': new_stat})
         except: pass
-
-def db_save_config(guild_id, category_id, start_channel_id, range_val):
-    data = get_guild_data(guild_id)
-    cfg = {'category_id': category_id, 'start_channel_id': start_channel_id, 'range': range_val}
-    data['config'] = cfg
-    try: ref_servers.child(str(guild_id)).child('config').set(cfg)
-    except: pass
-
-def db_save_user(guild_id, user_id, gamertag):
-    data = get_guild_data(guild_id)
-    data['users'][user_id] = gamertag
-    try: ref_servers.child(str(guild_id)).child('users').child(str(user_id)).set(gamertag)
-    except: pass
 
 # --- BOT SETUP ---
 intents = discord.Intents.default()
@@ -121,8 +139,10 @@ class MyBot(commands.Bot):
 
     async def setup_hook(self):
         app = web.Application()
+        # API Routes
         app.router.add_post('/update_coords', self.handle_coords)
         app.router.add_get('/', self.handle_index)
+        # Dashboard Routes
         app.router.add_get('/dashboard', self.handle_dashboard)
         app.router.add_post('/dashboard/add', self.handle_dash_add)
         app.router.add_post('/dashboard/remove', self.handle_dash_remove)
@@ -138,17 +158,13 @@ class MyBot(commands.Bot):
 
     # --- WEB HANDLERS ---
     async def handle_index(self, request):
-        count = sum(1 for g in server_data.values() if g.get('whitelist', {}).get('active'))
-        return web.Response(text=f"Bot Online | Active Whitelists: {count}")
+        return web.Response(text=f"Bot Online | Whitelist: {len(whitelist_data)}")
 
     async def handle_dashboard(self, request):
         try:
-            # Flatten data for template
-            whitelist_flat = {str(gid): d['whitelist'] for gid, d in server_data.items() if d.get('whitelist')}
-            
             env = Environment(loader=FileSystemLoader('templates'))
             template = env.get_template('dashboard.html')
-            rendered = template.render(whitelist=whitelist_flat, password=DASHBOARD_PASSWORD)
+            rendered = template.render(whitelist=whitelist_data, password=DASHBOARD_PASSWORD)
             return web.Response(text=rendered, content_type='text/html')
         except Exception as e: return web.Response(text=str(e), status=500)
 
@@ -157,44 +173,47 @@ class MyBot(commands.Bot):
     async def handle_dash_toggle(self, request):
         data = await request.post()
         if not await self.check_pass(data): return web.Response(text="Wrong Password", status=403)
-        db_toggle_whitelist(int(data.get('guild_id')))
+        db_toggle_whitelist(data.get('guild_id'))
         return web.HTTPFound('/dashboard')
 
     async def handle_dash_add(self, request):
         data = await request.post()
         if not await self.check_pass(data): return web.Response(text="Wrong Password", status=403)
         gid = data.get('guild_id')
-        if gid: db_save_whitelist(int(gid), "Added via Web")
+        if gid: db_add_whitelist(gid, "Added via Web")
         return web.HTTPFound('/dashboard')
 
     async def handle_dash_remove(self, request):
         data = await request.post()
         if not await self.check_pass(data): return web.Response(text="Wrong Password", status=403)
-        db_remove_whitelist(int(data.get('guild_id')))
+        db_remove_whitelist(data.get('guild_id'))
         return web.HTTPFound('/dashboard')
 
+    # --- 🟢 RESTORED LOGIC FROM ORIGINAL BOT 🟢 ---
+    # ใช้ Logic เดิมที่เสถียรที่สุดในการรับส่งข้อมูล
     async def handle_coords(self, request):
         try:
             data = await request.json()
+            
+            # 1. Update Game State
+            current_players = {}
+            for p in data:
+                current_players[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
+            
             global game_state
+            game_state = current_players
             
-            # 1. Update Game State (Global)
-            current = {}
-            for p in data: current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
-            game_state = current
-            
-            # 2. Collect ALL verified names from ALL servers to return
-            # (Safety net to prevent invalid name errors on any connected server)
+            # 2. Get Verified List (Always return this to prevent "Invalid Name" error)
             verified_names = []
-            for g_data in server_data.values():
-                verified_names.extend(g_data['users'].values())
+            for d_id, xbox in user_links.items():
+                # ส่งกลับไปบอก Minecraft ว่าคนนี้ยืนยันแล้วนะ (แม้จะไม่ออนไลน์ในเกมก็ตาม)
+                verified_names.append(xbox)
             
-            # 3. Process Logic
+            # 3. Process Voice Logic (Only if not rate limited)
             if not self.is_rate_limited:
                 await process_voice_logic()
             
-            # Return UNIQUE names
-            return web.json_response({'status': 'ok', 'verified': list(set(verified_names))})
+            return web.json_response({'status': 'ok', 'verified': verified_names})
         except Exception as e:
             print(f"API Error: {e}")
             return web.json_response({'status': 'error'}, status=500)
@@ -204,8 +223,8 @@ bot = MyBot()
 # --- SECURITY ---
 @bot.event
 async def on_guild_join(guild):
-    data = get_guild_data(guild.id)
-    if not data.get('whitelist'):
+    gid = str(guild.id)
+    if gid not in whitelist_data:
         if LOG_WEBHOOK_URL:
             async with ClientSession() as session:
                 webhook = Webhook.from_url(LOG_WEBHOOK_URL, session=session)
@@ -218,7 +237,7 @@ async def on_guild_join(guild):
         except: pass
         await guild.leave()
     else:
-        db_save_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
+        db_add_whitelist(gid, guild.name)
 
 # --- UI & COMMANDS ---
 class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
@@ -227,16 +246,17 @@ class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
         if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
         gamertag = self.xbox_name.value.strip()
         
-        # Save Scoped to Guild
-        db_save_user(interaction.guild_id, interaction.user.id, gamertag)
+        # Save to DB & Memory
+        db_save_user(interaction.user.id, gamertag, interaction.guild_id)
         
-        data = get_guild_data(interaction.guild_id)
-        cfg = data.get('config', {})
-        msg = f"✅ Saved **{gamertag}** for this server."
+        gid = interaction.guild_id
+        msg = f"✅ Saved **{gamertag}**"
         
-        if 'start_channel_id' in cfg:
-            chan = interaction.guild.get_channel(cfg['start_channel_id'])
+        if gid in server_config:
+            chan_id = server_config[gid]['start_channel_id']
+            chan = interaction.guild.get_channel(chan_id)
             if chan: msg += f"\n👉 Go to {chan.mention}"
+            
         await interaction.followup.send(msg, ephemeral=True)
 
 class SetupView(ui.View):
@@ -251,8 +271,9 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
     if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
     if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
     
-    db_save_whitelist(interaction.guild_id, interaction.guild.name)
-    db_save_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
+    # Save Config
+    db_add_whitelist(interaction.guild_id, interaction.guild.name)
+    db_save_config(interaction.guild_id, category.id, start_channel.id, range_config.get(interaction.guild_id, DEFAULT_RANGE))
 
     msg = "✅ Setup Complete!"
     if role:
@@ -274,59 +295,57 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
 @bot.tree.command(name="whitelist")
 async def wl(i: discord.Interaction, server_id: str):
     if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ Admin Only", ephemeral=True)
-    db_save_whitelist(int(server_id), "Added via Cmd")
+    db_add_whitelist(server_id, "Added via Cmd")
     await i.response.send_message(f"✅ Whitelisted {server_id}", ephemeral=True)
 
 @bot.tree.command(name="delwhitelist")
 async def dwl(i: discord.Interaction, server_id: str):
     if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ Admin Only", ephemeral=True)
-    db_remove_whitelist(int(server_id))
+    db_remove_whitelist(server_id)
     await i.response.send_message(f"🗑️ Deleted {server_id}", ephemeral=True)
 
 @bot.tree.command(name="range")
 async def set_range(i: discord.Interaction, distance: int):
-    data = get_guild_data(i.guild_id)
-    cfg = data.get('config', {})
-    if 'category_id' in cfg:
-        db_save_config(i.guild_id, cfg['category_id'], cfg['start_channel_id'], distance)
-        await i.response.send_message(f"🔊 Range set to {distance}", ephemeral=True)
+    gid = i.guild_id
+    if gid in server_config:
+        cfg = server_config[gid]
+        db_save_config(gid, cfg['category_id'], cfg['start_channel_id'], distance)
     else:
-        await i.response.send_message("❌ Please run /setup first", ephemeral=True)
+        # Fallback if config not set yet
+        range_config[gid] = distance
+    await i.response.send_message(f"🔊 Range set to {distance}", ephemeral=True)
 
-# --- CORE LOGIC (Few-to-Many + Disconnect + Majority Rule) ---
+# --- LOGIC (Few-to-Many + Anti-Rate Limit + Disconnect) ---
 async def process_voice_logic():
     curr = time.time()
+    # Cleanup Cooldowns
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
 
-    # Iterate through all loaded server data
-    for guild_id, data in server_data.items():
-        if not data.get('whitelist', {}).get('active'): continue
+    for guild_id, config in server_config.items():
+        gid_str = str(guild_id)
+        if gid_str not in whitelist_data or not whitelist_data[gid_str]['active']: continue
         
-        cfg = data.get('config', {})
-        if not cfg: continue
-
         guild = bot.get_guild(guild_id)
         if not guild: continue
         
-        cat = guild.get_channel(cfg.get('category_id'))
-        start = guild.get_channel(cfg.get('start_channel_id'))
+        cat = guild.get_channel(config['category_id'])
+        start = guild.get_channel(config['start_channel_id'])
         if not cat or not start: continue
         
-        dist_sq = cfg.get('range', DEFAULT_RANGE) ** 2
-        users_map = data.get('users', {}) # Users specific to this guild
+        dist_sq = range_config.get(guild_id, DEFAULT_RANGE) ** 2
         
-        # 1. Gather Online Users
         online = []
-        for uid, gamertag in users_map.items():
+        for uid, gamertag in user_links.items():
             mem = guild.get_member(uid)
             if not mem or not mem.voice or not mem.voice.channel: continue
             if mem.voice.channel.category_id != cat.id: continue
             
             if gamertag in game_state:
+                # In Game
                 p = game_state[gamertag]
                 online.append((mem, p['x'], p['y'], p['z']))
             else:
-                # Disconnect -> Lobby
+                # Disconnected -> Move to Lobby (Lobby Check)
                 if mem.voice.channel.id != start.id:
                     if curr - user_last_move.get(mem.id, 0) > MOVE_COOLDOWN:
                         try: 
@@ -335,7 +354,7 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
-        # 2. Clustering
+        # Clustering
         groups = []
         processed = set()
         for i in range(len(online)):
@@ -351,54 +370,38 @@ async def process_voice_logic():
                     processed.add(j)
             groups.append(grp)
             
-        # 3. Channel Management (Majority Rule)
+        # Assign & Move
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
         taken = set()
         
         for g in groups:
             target = None
-            room_counts = {}
+            votes = {}
             for m in g:
-                c = m.voice.channel
-                room_counts[c] = room_counts.get(c, 0) + 1
-            
-            # Majority Vote
-            majority_channel = max(room_counts, key=room_counts.get)
-            
-            if majority_channel.id == start.id:
-                # Majority in Lobby -> New Room for everyone
-                for c in avail:
-                    if len(c.members) == 0 and c.id not in taken:
-                        target = c
-                        break
-            else:
-                # Majority in Game Room -> Few to Many
-                target = majority_channel
-            
-            # Fallback if target invalid
+                if m.voice.channel.id != start.id and m.voice.channel.id not in taken:
+                    votes[m.voice.channel] = votes.get(m.voice.channel, 0)+1
+            if votes: target = max(votes, key=votes.get)
             if not target:
-                 # Try finding any non-lobby room in the group
-                 for c in room_counts:
-                     if c.id != start.id: target = c; break
-            
+                for c in avail:
+                    if len(c.members)==0 and c.id not in taken: target=c; break
             if not target: continue
             taken.add(target.id)
             
-            # Move Logic
             for m in g:
-                if m.voice.channel.id != target.id:
-                    if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
-                    try:
-                        await m.move_to(target)
-                        user_last_move[m.id] = curr
-                        await asyncio.sleep(0.2)
-                    except discord.HTTPException as e:
-                        if e.status == 429: await asyncio.sleep(2)
+                if m.voice.channel.id == target.id: continue
+                if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
+                try:
+                    await m.move_to(target)
+                    user_last_move[m.id] = curr
+                    await asyncio.sleep(0.2)
+                except discord.HTTPException as e:
+                    if e.status==429: await asyncio.sleep(2)
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
-    time.sleep(random.randint(5, 10))
+    # Start Delay to prevent rate limit on frequent restarts
+    time.sleep(random.randint(5, 15))
     while True:
         try:
             bot.is_rate_limited = False
@@ -406,6 +409,6 @@ if __name__ == "__main__":
         except discord.errors.HTTPException as e:
             if e.status == 429:
                 bot.is_rate_limited = True
-                time.sleep(60)
+                time.sleep(60) # Sleep longer if rate limited
             else: time.sleep(10)
         except: time.sleep(30)
