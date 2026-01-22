@@ -23,7 +23,6 @@ DEFAULT_RANGE = 10
 MOVE_COOLDOWN = 3.0
 
 # --- DATA STORES (In-Memory) ---
-# โครงสร้างใหม่: แยกข้อมูลตาม Guild ID เพื่อไม่ให้ตีกัน
 server_data = {}  # { guild_id: { 'whitelist': {}, 'config': {}, 'users': {uid: gamertag} } }
 game_state = {}   # { gamertag: {x, y, z} } (Global)
 user_last_move = {}
