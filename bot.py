@@ -20,9 +20,8 @@ MOVE_COOLDOWN = 3.0
 DATA_FILE = "server_data.json"
 
 # --- DATA STORES ---
-# โครงสร้าง: { guild_id: { 'whitelist': {}, 'config': {}, 'users': {uid: gamertag} } }
 server_data = {}  
-game_state = {}   # Global Game State (ตำแหน่งผู้เล่น)
+game_state = {}   
 user_last_move = {}
 
 # --- LOCAL STORAGE SYSTEM ---
@@ -32,14 +31,10 @@ def load_data():
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 raw_data = json.load(f)
-                # แปลง Key จาก String เป็น Int (เพราะ JSON เก็บ Key เป็น String เสมอ)
                 server_data = {int(k): v for k, v in raw_data.items()}
-                
-                # แปลง User ID ใน users กลับเป็น Int ด้วย
                 for gid in server_data:
                     if 'users' in server_data[gid]:
                         server_data[gid]['users'] = {int(uid): tag for uid, tag in server_data[gid]['users'].items()}
-                        
             print(f"✅ Loaded Data: {len(server_data)} Servers")
         except Exception as e:
             print(f"⚠️ Load Error: {e}")
@@ -52,7 +47,6 @@ def save_data():
     except Exception as e:
         print(f"⚠️ Save Error: {e}")
 
-# Load data on start
 load_data()
 
 # --- HELPER FUNCTIONS ---
@@ -119,16 +113,13 @@ class MyBot(commands.Bot):
         try: await self.tree.sync()
         except: pass
 
-    # --- WEB HANDLERS ---
     async def handle_index(self, request):
         count = sum(1 for g in server_data.values() if g.get('whitelist', {}).get('active'))
         return web.Response(text=f"Bot Online (Local Mode) | Active Whitelists: {count}")
 
     async def handle_dashboard(self, request):
         try:
-            # Flatten data for template
             whitelist_flat = {str(gid): d.get('whitelist') for gid, d in server_data.items() if d.get('whitelist')}
-            
             env = Environment(loader=FileSystemLoader('templates'))
             template = env.get_template('dashboard.html')
             rendered = template.render(whitelist=whitelist_flat, password=DASHBOARD_PASSWORD)
@@ -161,30 +152,27 @@ class MyBot(commands.Bot):
             data = await request.json()
             global game_state
             
-            # 1. Update Game State
+            # อัปเดตตำแหน่งล่าสุดของผู้เล่นทุกคน
             current = {}
             for p in data: current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
             
-            # 2. Collect Verified Users (from all servers to prevent invalid name error)
+            # ส่งรายชื่อที่ยืนยันแล้วกลับไป (ป้องกัน Invalid Name ในเกม)
             verified_names = []
             for g_data in server_data.values():
                 verified_names.extend(g_data.get('users', {}).values())
             
-            verified_names = list(set(verified_names))
-            
-            # 3. Process Logic
+            # เรียกฟังก์ชันจัดการห้องเสียง
             if not self.is_rate_limited:
                 await process_voice_logic()
             
-            return web.json_response({'status': 'ok', 'verified': verified_names})
+            return web.json_response({'status': 'ok', 'verified': list(set(verified_names))})
         except Exception as e:
             print(f"API Error: {e}")
             return web.json_response({'status': 'error'}, status=500)
 
 bot = MyBot()
 
-# --- SECURITY ---
 @bot.event
 async def on_guild_join(guild):
     data = get_guild_data(guild.id)
@@ -203,20 +191,16 @@ async def on_guild_join(guild):
     else:
         update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
 
-# --- UI & COMMANDS ---
 class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
     xbox_name = ui.TextInput(label='Xbox Gamertag')
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
         gamertag = self.xbox_name.value.strip()
-        
-        # Save User (Scoped)
         update_user(interaction.guild_id, interaction.user.id, gamertag)
         
         data = get_guild_data(interaction.guild_id)
         cfg = data.get('config', {})
-        msg = f"✅ Saved **{gamertag}** for this server."
-        
+        msg = f"✅ Saved **{gamertag}**"
         if 'start_channel_id' in cfg:
             chan = interaction.guild.get_channel(cfg['start_channel_id'])
             if chan: msg += f"\n👉 Go to {chan.mention}"
@@ -251,7 +235,6 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
         await interaction.edit_original_response(content=msg)
     else:
         await interaction.followup.send(msg, ephemeral=True)
-    
     await interaction.channel.send(embed=discord.Embed(title="Voice Chat", description="Click to Connect", color=0x2ecc71), view=SetupView())
 
 @bot.tree.command(name="whitelist")
@@ -276,7 +259,7 @@ async def set_range(i: discord.Interaction, distance: int):
     else:
         await i.response.send_message("❌ Please run /setup first", ephemeral=True)
 
-# --- CORE LOGIC (Few-to-Many + Majority Rule) ---
+# --- 🟢 CORE LOGIC: Auto-Move & Disconnect Handling 🟢 ---
 async def process_voice_logic():
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
@@ -301,12 +284,16 @@ async def process_voice_logic():
         for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
             if not mem or not mem.voice or not mem.voice.channel: continue
+            # เช็คว่าอยู่ใน Category ของบอทหรือไม่ (ถ้าไม่อยู่ ไม่ต้องยุ่ง)
             if mem.voice.channel.category_id != cat.id: continue
             
+            # ✅ LOGIC 1: เช็คว่าอยู่ในเกมหรือไม่?
             if gamertag in game_state:
+                # ยังอยู่ในเกม -> เก็บข้อมูลไว้จัดกลุ่ม
                 p = game_state[gamertag]
                 online.append((mem, p['x'], p['y'], p['z']))
             else:
+                # ❌ ออกจากเกมแล้ว (Disconnect) -> ย้ายกลับ Lobby
                 if mem.voice.channel.id != start.id:
                     if curr - user_last_move.get(mem.id, 0) > MOVE_COOLDOWN:
                         try: 
@@ -315,6 +302,10 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
+        # --- ถ้าไม่มีคนออนไลน์ในเกม ก็จบการทำงานของรอบนี้ ---
+        if not online: continue
+
+        # ✅ LOGIC 2: จัดกลุ่มคนเล่น (Clustering)
         groups = []
         processed = set()
         for i in range(len(online)):
@@ -330,6 +321,7 @@ async def process_voice_logic():
                     processed.add(j)
             groups.append(grp)
             
+        # ✅ LOGIC 3: เลือกห้อง (Few-to-Many & Majority Rule)
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
         taken = set()
         
@@ -340,14 +332,17 @@ async def process_voice_logic():
                 c = m.voice.channel
                 room_counts[c] = room_counts.get(c, 0) + 1
             
+            # หาห้องที่คนส่วนใหญ่อยู่
             majority_channel = max(room_counts, key=room_counts.get)
             
             if majority_channel.id == start.id:
+                # กรณี A: คนส่วนใหญ่อยู่ Lobby -> หาห้องว่างห้องใหม่ให้ทุกคน
                 for c in avail:
                     if len(c.members) == 0 and c.id not in taken:
                         target = c
                         break
             else:
+                # กรณี B: คนส่วนใหญ่อยู่ห้องเกม -> ย้ายคนส่วนน้อยไปหา (Few to Many)
                 target = majority_channel
             
             if not target:
@@ -367,7 +362,6 @@ async def process_voice_logic():
                     except discord.HTTPException as e:
                         if e.status == 429: await asyncio.sleep(2)
 
-# --- MAIN LOOP ---
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
     time.sleep(random.randint(5, 10))
