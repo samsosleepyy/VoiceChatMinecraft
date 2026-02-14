@@ -313,6 +313,10 @@ async def process_voice_logic():
             if name.startswith("botvc"):
                 online.append(("DUMMY", p['x'], p['y'], p['z']))
                 has_dummy_globally = True
+        
+        # DEBUG: ถ้าเจอบอททดสอบ ให้ Print ออก console (ดูที่จอที่รัน bot.py)
+        if has_dummy_globally:
+            print(f"DEBUG: Found botvc in guild {guild.name}")
 
         if not online: 
             if guild.voice_client: await guild.voice_client.disconnect()
@@ -341,7 +345,6 @@ async def process_voice_logic():
         
         bot_target_channel = None 
 
-        # ถ้ามีบอท Armor Stand แต่ไม่มีใครเข้ากลุ่มกับมัน (คืออยู่คนเดียว) ให้บอท Discord ไปรอที่ Lobby
         if has_dummy_globally:
             bot_target_channel = start
 
@@ -358,7 +361,6 @@ async def process_voice_logic():
                 c = m.voice.channel
                 room_counts[c] = room_counts.get(c, 0) + 1
             
-            # ถ้ากลุ่มนี้มีแค่ Dummy (ไม่มีคนจริง) -> ข้ามการหาห้อง (ให้มันใช้ Logic Default คืออยู่ Lobby)
             if not has_real: continue
 
             if not room_counts: majority_channel = start 
@@ -379,11 +381,9 @@ async def process_voice_logic():
             if not target: continue
             taken.add(target.id)
             
-            # ถ้ากลุ่มนี้มี Dummy อยู่ด้วย ให้บอท Discord ย้ายตามไปห้องนี้
             if has_dummy_in_group: 
                 bot_target_channel = target
             
-            # ย้ายคน
             for m in g:
                 if m == "DUMMY": continue 
                 if m.voice.channel.id != target.id:
@@ -395,19 +395,23 @@ async def process_voice_logic():
                     except discord.HTTPException as e:
                         if e.status == 429: await asyncio.sleep(2)
         
-        # 4. Bot Movement Control
+        # 4. Bot Movement Control (Force Connect Logic)
         if bot_target_channel:
-            # มีห้องต้องไป (Lobby หรือ Game Room)
             if guild.voice_client:
-                # ถ้าอยู่ผิดห้อง ให้ย้าย
+                # ถ้าเชื่อมต่ออยู่
                 if guild.voice_client.channel.id != bot_target_channel.id:
                     await guild.voice_client.move_to(bot_target_channel)
             else:
-                # ถ้ายังไม่เข้า ให้เข้า
-                try: await bot_target_channel.connect()
-                except: pass
+                # ถ้ายังไม่เชื่อมต่อเลย ให้เข้าห้อง
+                try: 
+                    await bot_target_channel.connect()
+                except discord.ClientException:
+                    # กรณีค้าง (คิดว่าต่ออยู่แต่จริงๆ หลุด) ให้ reset
+                    await guild.voice_client.disconnect(force=True)
+                    await bot_target_channel.connect()
+                except Exception as e:
+                    print(f"Bot Connect Error: {e}")
         else:
-            # ไม่มี Dummy ในโลกเลย -> ออก
             if guild.voice_client:
                 await guild.voice_client.disconnect()
 
