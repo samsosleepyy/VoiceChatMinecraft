@@ -20,8 +20,6 @@ MOVE_COOLDOWN = 3.0
 DATA_FILE = "server_data.json"
 
 # --- DATA STORES ---
-# server_data: เก็บข้อมูลถาวร (Whitelist, Config, User Link)
-# game_state: เก็บพิกัด Real-time (รีเซ็ตเมื่อบอทดับ)
 server_data = {}  
 game_state = {}   
 user_last_move = {}
@@ -33,7 +31,6 @@ def load_data():
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 raw_data = json.load(f)
-                # แปลง Key กลับเป็น int เพราะ JSON เก็บ Key เป็น String
                 server_data = {int(k): v for k, v in raw_data.items()}
                 for gid in server_data:
                     if 'users' in server_data[gid]:
@@ -50,7 +47,6 @@ def save_data():
     except Exception as e:
         print(f"⚠️ Save Error: {e}")
 
-# โหลดข้อมูลเมื่อเริ่มบอท
 load_data()
 
 # --- HELPER FUNCTIONS ---
@@ -100,7 +96,6 @@ class MyBot(commands.Bot):
         self.is_rate_limited = False
 
     async def setup_hook(self):
-        # ตั้งค่า Web Server สำหรับรับข้อมูลจาก Minecraft
         app = web.Application()
         app.router.add_post('/update_coords', self.handle_coords)
         app.router.add_get('/', self.handle_index)
@@ -152,20 +147,16 @@ class MyBot(commands.Bot):
         remove_whitelist(int(data.get('guild_id')))
         return web.HTTPFound('/dashboard')
 
-    # --- 🟢 HANDLE COORDS API 🟢 ---
     async def handle_coords(self, request):
         try:
             data = await request.json()
             global game_state
             
-            # 1. Update Game State (Global)
-            # data structure: [{name: 'Steve', x: 10, y: 60, z: 10}, ...]
             current = {}
             for p in data: 
                 current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
             
-            # 2. Trigger Logic
             if not self.is_rate_limited:
                 await process_voice_logic()
             
@@ -176,7 +167,6 @@ class MyBot(commands.Bot):
 
 bot = MyBot()
 
-# --- SECURITY EVENTS ---
 @bot.event
 async def on_guild_join(guild):
     data = get_guild_data(guild.id)
@@ -195,7 +185,7 @@ async def on_guild_join(guild):
     else:
         update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
 
-# --- UI CLASSES (UPDATED) ---
+# --- UI CLASSES ---
 
 class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
     xbox_name = ui.TextInput(label='Xbox Gamertag', placeholder='ใส่ชื่อในเกมของคุณ...', min_length=3, max_length=20)
@@ -203,12 +193,10 @@ class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         gamertag = self.xbox_name.value.strip()
-        
         update_user(interaction.guild_id, interaction.user.id, gamertag)
         
         data = get_guild_data(interaction.guild_id)
         cfg = data.get('config', {})
-        
         msg = f"✅ บันทึกชื่อ **{gamertag}** สำเร็จ!"
         if 'start_channel_id' in cfg:
             chan = interaction.guild.get_channel(cfg['start_channel_id'])
@@ -217,16 +205,11 @@ class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
         await interaction.followup.send(msg, ephemeral=True)
 
 class SetupView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    # ปุ่ม Connect
+    def __init__(self): super().__init__(timeout=None)
     @ui.button(label="Connect", style=discord.ButtonStyle.green, custom_id="mc_link", emoji="🔗")
     async def link(self, i: discord.Interaction, b: ui.Button):
         data = get_guild_data(i.guild_id)
         users = data.get('users', {})
-        
-        # เช็คว่าเชื่อมต่อแล้วหรือยัง
         if i.user.id in users:
             gamertag = users[i.user.id]
             msg = f"⚠️ คุณเชื่อมต่อไว้แล้วในชื่อ **{gamertag}**\nหากต้องการเปลี่ยนชื่อ ให้กดปุ่ม **📝 Edit Name**"
@@ -234,41 +217,22 @@ class SetupView(ui.View):
         else:
             await i.response.send_modal(LinkModal())
 
-    # ปุ่ม Edit
     @ui.button(label="Edit Name", style=discord.ButtonStyle.secondary, custom_id="mc_edit", emoji="📝")
-    async def edit(self, i: discord.Interaction, b: ui.Button):
-        await i.response.send_modal(LinkModal())
+    async def edit(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(LinkModal())
 
-    # ปุ่ม Status (ใหม่)
     @ui.button(label="Check Status", style=discord.ButtonStyle.primary, custom_id="mc_status", emoji="📊")
     async def status(self, i: discord.Interaction, b: ui.Button):
         data = get_guild_data(i.guild_id)
         users = data.get('users', {})
-        
         if i.user.id not in users:
-            return await i.response.send_message("❌ คุณยังไม่ได้เชื่อมต่อบัญชี (กด Connect เพื่อเริ่มใช้งาน)", ephemeral=True)
-
+            return await i.response.send_message("❌ คุณยังไม่ได้เชื่อมต่อบัญชี", ephemeral=True)
         gamertag = users[i.user.id]
-        
-        # เช็คว่าตอนนี้ชื่อนี้ออนไลน์ในเกมหรือไม่ (ดูจาก game_state)
-        is_online_in_game = gamertag in game_state
-        
-        # สร้าง Embed แสดงสถานะ
-        embed = discord.Embed(title="📊 ข้อมูลสถานะของคุณ", color=0x3498db)
+        is_online = gamertag in game_state
+        embed = discord.Embed(title="📊 ข้อมูลสถานะ", color=0x3498db)
         embed.add_field(name="👤 Discord", value=i.user.mention, inline=True)
         embed.add_field(name="🎮 Gamertag", value=f"**{gamertag}**", inline=True)
-        
-        if is_online_in_game:
-            status_txt = "🟢 Online (อยู่ในเกม)" 
-        else:
-            status_txt = "🔴 Offline (ไม่อยู่ในเกม)"
-
-        embed.add_field(name="Server Status", value=status_txt, inline=False)
-        embed.set_footer(text="Status Updated: Real-time")
-        
+        embed.add_field(name="Server Status", value="🟢 Online" if is_online else "🔴 Offline", inline=False)
         await i.response.send_message(embed=embed, ephemeral=True)
-
-# --- COMMANDS ---
 
 @bot.tree.command(name="setup")
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
@@ -278,7 +242,7 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
     update_whitelist(interaction.guild_id, interaction.guild.name)
     update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
 
-    msg_status = "✅ Setup Complete!"
+    msg = "✅ Setup Complete!"
     if role:
         await interaction.followup.send(f"⏳ Setting permissions...", ephemeral=True)
         try:
@@ -286,19 +250,14 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
             await start_channel.set_permissions(role, view_channel=True, connect=True)
             if isinstance(interaction.channel, discord.TextChannel):
                  await interaction.channel.set_permissions(role, view_channel=True)
-            msg_status += "\n✨ Permissions Updated"
-        except: msg_status += "\n⚠️ Permission Error"
-        await interaction.edit_original_response(content=msg_status)
+            msg += "\n✨ Permissions Updated"
+        except: msg += "\n⚠️ Permission Error"
+        await interaction.edit_original_response(content=msg)
     else:
-        await interaction.followup.send(msg_status, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
     
-    embed = discord.Embed(
-        title="🎙️ Minecraft Voice Chat", 
-        description="กดปุ่มด้านล่างเพื่อเชื่อมต่อ Discord กับ Minecraft", 
-        color=0x2ecc71
-    )
-    embed.add_field(name="วิธีการใช้งาน", value="1. กด **Connect** เพื่อใส่ชื่อในเกม\n2. เข้าห้องเสียง **Lobby** เพื่อรอ\n3. เมื่อเข้าเกม บอทจะย้ายคุณอัตโนมัติ")
-    
+    embed = discord.Embed(title="🎙️ Minecraft Voice Chat", description="กดปุ่มด้านล่างเพื่อเชื่อมต่อ", color=0x2ecc71)
+    embed.add_field(name="วิธีการใช้งาน", value="1. กด **Connect** เพื่อใส่ชื่อ\n2. เข้าห้องเสียง **Lobby** เพื่อรอ")
     await interaction.channel.send(embed=embed, view=SetupView())
 
 @bot.tree.command(name="whitelist")
@@ -323,15 +282,13 @@ async def set_range(i: discord.Interaction, distance: int):
     else:
         await i.response.send_message("❌ Please run /setup first", ephemeral=True)
 
-# --- 🟢 CORE LOGIC: Auto-Move & Separation (With Test Dummy) 🟢 ---
+# --- 🟢 CORE LOGIC: Auto-Move & Bot Join (Testing) 🟢 ---
 async def process_voice_logic():
     curr = time.time()
-    # Cleanup Cooldowns
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
 
     for guild_id, data in server_data.items():
         if not data.get('whitelist', {}).get('active'): continue
-        
         cfg = data.get('config', {})
         if not cfg: continue
 
@@ -345,7 +302,7 @@ async def process_voice_logic():
         dist_sq = cfg.get('range', DEFAULT_RANGE) ** 2
         users_map = data.get('users', {})
         
-        # 1. Gather Online Users (คนจริงๆ)
+        # 1. Gather Users
         online = []
         for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
@@ -356,7 +313,6 @@ async def process_voice_logic():
                 p = game_state[gamertag]
                 online.append((mem, p['x'], p['y'], p['z']))
             else:
-                # ❌ Not In Game -> Move to Lobby
                 if mem.voice.channel.id != start.id:
                     if curr - user_last_move.get(mem.id, 0) > MOVE_COOLDOWN:
                         try: 
@@ -365,16 +321,17 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
-        # 🤖 1.5 Gather Dummies (บอททดสอบ)
-        # เช็คข้อมูลที่ส่งมา ถ้าชื่อขึ้นต้นด้วย botvc ให้ถือว่าเป็นผู้เล่นจำลอง
+        # 🤖 Gather Dummies (Armor Stand)
         for name, p in game_state.items():
             if name.startswith("botvc"):
-                # ใส่ "DUMMY" แทน object ของคน เพื่อให้รู้ว่าเป็นบอท
                 online.append(("DUMMY", p['x'], p['y'], p['z']))
 
-        if not online: continue
+        if not online: 
+            # ถ้าไม่มีใครอยู่ และบอทค้างในห้อง ให้บอทออก
+            if guild.voice_client: await guild.voice_client.disconnect()
+            continue
 
-        # 2. Clustering (Distance)
+        # 2. Clustering
         groups = []
         processed = set()
         for i in range(len(online)):
@@ -393,51 +350,50 @@ async def process_voice_logic():
         # 3. Room Management
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
         taken = set() 
-        
         groups.sort(key=len, reverse=True)
+        
+        bot_target_channel = None # ห้องที่บอทควรจะไปอยู่
 
         for g in groups:
+            # เช็คว่ากลุ่มนี้มี Dummy (Armor Stand) ไหม
+            has_dummy = any(m == "DUMMY" for m in g)
+            
             target = None
             room_counts = {}
-            has_real_player = False
+            has_real = False
 
-            # นับโหวตห้อง (เฉพาะคนจริง บอทไม่มีสิทธิ์โหวตเพราะไม่มีห้อง)
             for m in g:
                 if m == "DUMMY": continue 
-                has_real_player = True
+                has_real = True
                 c = m.voice.channel
                 room_counts[c] = room_counts.get(c, 0) + 1
             
-            # ถ้ากลุ่มนี้มีแต่บอท Armor Stand ล้วนๆ -> ข้ามไปเลย ไม่ต้องหาห้องให้
-            if not has_real_player: continue
+            if not has_real: continue
 
-            if not room_counts:
-                majority_channel = start 
-            else:
-                majority_channel = max(room_counts, key=room_counts.get)
+            if not room_counts: majority_channel = start 
+            else: majority_channel = max(room_counts, key=room_counts.get)
             
             need_new_room = (majority_channel.id == start.id) or (majority_channel.id in taken)
             
             if need_new_room:
                 for c in avail:
                     if len(c.members) == 0 and c.id not in taken:
-                        target = c
-                        break
+                        target = c; break
                 if not target:
                     for c in avail:
-                        if c.id not in taken:
-                            target = c
-                            break
+                        if c.id not in taken: target = c; break
             else:
                 target = majority_channel
             
             if not target: continue
             taken.add(target.id)
             
-            # ย้ายคน (ข้ามบอท DUMMY)
+            # ถ้ากลุ่มนี้มี Dummy ให้เซ็ตห้องนี้เป็นห้องที่บอทต้องไป
+            if has_dummy: bot_target_channel = target
+            
+            # ย้ายคน
             for m in g:
                 if m == "DUMMY": continue 
-                
                 if m.voice.channel.id != target.id:
                     if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
                     try:
@@ -446,8 +402,22 @@ async def process_voice_logic():
                         await asyncio.sleep(0.2)
                     except discord.HTTPException as e:
                         if e.status == 429: await asyncio.sleep(2)
+        
+        # 4. Bot Movement (Join Voice)
+        if bot_target_channel:
+            # ถ้ามีห้องเป้าหมายที่บอทต้องไป
+            if guild.voice_client:
+                # ถ้าเชื่อมต่ออยู่แล้ว แต่ผิดห้อง ให้ย้าย
+                if guild.voice_client.channel.id != bot_target_channel.id:
+                    await guild.voice_client.move_to(bot_target_channel)
+            else:
+                # ถ้ายังไม่เชื่อมต่อ ให้เข้ามาเลย
+                await bot_target_channel.connect()
+        else:
+            # ถ้าไม่มีกลุ่มไหนต้องการบอท (ไม่มี Armor Stand) ให้ออก
+            if guild.voice_client:
+                await guild.voice_client.disconnect()
 
-# --- MAIN LOOP ---
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
     time.sleep(random.randint(5, 10))
