@@ -326,7 +326,7 @@ async def set_range(i: discord.Interaction, distance: int):
     else:
         await i.response.send_message("❌ Please run /setup first", ephemeral=True)
 
-# --- 🟢 CORE LOGIC: Auto-Move & Separation 🟢 ---
+# --- 🟢 CORE LOGIC: Auto-Move & Separation (With Test Dummy) 🟢 ---
 async def process_voice_logic():
     curr = time.time()
     # Cleanup Cooldowns
@@ -348,14 +348,13 @@ async def process_voice_logic():
         dist_sq = cfg.get('range', DEFAULT_RANGE) ** 2
         users_map = data.get('users', {})
         
-        # 1. Gather Online Users
+        # 1. Gather Online Users (คนจริงๆ)
         online = []
         for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
             if not mem or not mem.voice or not mem.voice.channel: continue
             if mem.voice.channel.category_id != cat.id: continue
             
-            # LOGIC: Check In-Game Status
             if gamertag in game_state:
                 p = game_state[gamertag]
                 online.append((mem, p['x'], p['y'], p['z']))
@@ -369,6 +368,13 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
+        # 🤖 1.5 Gather Dummies (บอททดสอบ)
+        # เช็คข้อมูลที่ส่งมา ถ้าชื่อขึ้นต้นด้วย botvc ให้ถือว่าเป็นผู้เล่นจำลอง
+        for name, p in game_state.items():
+            if name.startswith("botvc"):
+                # ใส่ "DUMMY" แทน object ของคน เพื่อให้รู้ว่าเป็นบอท
+                online.append(("DUMMY", p['x'], p['y'], p['z']))
+
         if not online: continue
 
         # 2. Clustering (Distance)
@@ -387,57 +393,54 @@ async def process_voice_logic():
                     processed.add(j)
             groups.append(grp)
             
-        # 3. Room Management (Separation Logic)
+        # 3. Room Management
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
         taken = set() 
         
-        # เรียงกลุ่มตามขนาด (คนเยอะได้สิทธิ์เลือกก่อน...หรือจะเอาคนน้อยก่อนก็ได้แล้วแต่ Logic)
-        # ปกติคนเยอะมักจะครองห้องเดิมไว้
         groups.sort(key=len, reverse=True)
 
         for g in groups:
             target = None
             room_counts = {}
+            has_real_player = False
+
+            # นับโหวตห้อง (เฉพาะคนจริง บอทไม่มีสิทธิ์โหวตเพราะไม่มีห้อง)
             for m in g:
+                if m == "DUMMY": continue 
+                has_real_player = True
                 c = m.voice.channel
                 room_counts[c] = room_counts.get(c, 0) + 1
             
-            # หาห้องที่สมาชิกส่วนใหญ่อยู่
+            # ถ้ากลุ่มนี้มีแต่บอท Armor Stand ล้วนๆ -> ข้ามไปเลย ไม่ต้องหาห้องให้
+            if not has_real_player: continue
+
             if not room_counts:
-                # กรณีเพิ่งเข้ามา ยังไม่มีห้อง
                 majority_channel = start 
             else:
                 majority_channel = max(room_counts, key=room_counts.get)
             
-            # เงื่อนไขการหาห้องใหม่:
-            # 1. ส่วนใหญ่อยู่ Lobby (Start)
-            # 2. ห้องเดิมโดนจองโดยกลุ่มอื่นไปแล้ว (Separation)
             need_new_room = (majority_channel.id == start.id) or (majority_channel.id in taken)
             
             if need_new_room:
-                # หาห้องว่างจริงๆ (สมาชิก 0 คน และยังไม่ถูกจอง)
                 for c in avail:
                     if len(c.members) == 0 and c.id not in taken:
                         target = c
                         break
-                
-                # ถ้าไม่มีห้องว่างจริงๆ เอาห้องไหนก็ได้ที่ยังไม่ถูกจอง
                 if not target:
                     for c in avail:
                         if c.id not in taken:
                             target = c
                             break
             else:
-                # ใช้ห้องเดิมได้
                 target = majority_channel
             
             if not target: continue
-            
-            # จองห้องนี้ไว้
             taken.add(target.id)
             
-            # ย้ายคน
+            # ย้ายคน (ข้ามบอท DUMMY)
             for m in g:
+                if m == "DUMMY": continue 
+                
                 if m.voice.channel.id != target.id:
                     if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
                     try:
@@ -446,7 +449,6 @@ async def process_voice_logic():
                         await asyncio.sleep(0.2)
                     except discord.HTTPException as e:
                         if e.status == 429: await asyncio.sleep(2)
-
 # --- MAIN LOOP ---
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
