@@ -19,7 +19,6 @@ DEFAULT_RANGE = 10
 MOVE_COOLDOWN = 3.0
 DATA_FILE = "server_data.json"
 
-# --- DATA STORES ---
 server_data = {}  
 game_state = {}   
 user_last_move = {}
@@ -49,7 +48,6 @@ def save_data():
 
 load_data()
 
-# --- HELPER FUNCTIONS ---
 def get_guild_data(guild_id):
     if guild_id not in server_data:
         server_data[guild_id] = {'whitelist': {}, 'config': {}, 'users': {}}
@@ -83,7 +81,6 @@ def update_user(guild_id, user_id, gamertag):
     data['users'][user_id] = gamertag
     save_data()
 
-# --- BOT SETUP ---
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
@@ -151,15 +148,12 @@ class MyBot(commands.Bot):
         try:
             data = await request.json()
             global game_state
-            
             current = {}
             for p in data: 
                 current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
-            
             if not self.is_rate_limited:
                 await process_voice_logic()
-            
             return web.json_response({'status': 'ok'})
         except Exception as e:
             print(f"API Error: {e}")
@@ -185,23 +179,18 @@ async def on_guild_join(guild):
     else:
         update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
 
-# --- UI CLASSES ---
-
 class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
     xbox_name = ui.TextInput(label='Xbox Gamertag', placeholder='ใส่ชื่อในเกมของคุณ...', min_length=3, max_length=20)
-
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         gamertag = self.xbox_name.value.strip()
         update_user(interaction.guild_id, interaction.user.id, gamertag)
-        
         data = get_guild_data(interaction.guild_id)
         cfg = data.get('config', {})
         msg = f"✅ บันทึกชื่อ **{gamertag}** สำเร็จ!"
         if 'start_channel_id' in cfg:
             chan = interaction.guild.get_channel(cfg['start_channel_id'])
             if chan: msg += f"\n👉 กรุณาไปรอที่ห้อง: {chan.mention}"
-            
         await interaction.followup.send(msg, ephemeral=True)
 
 class SetupView(ui.View):
@@ -238,10 +227,8 @@ class SetupView(ui.View):
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
     if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
     if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
-    
     update_whitelist(interaction.guild_id, interaction.guild.name)
     update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
-
     msg = "✅ Setup Complete!"
     if role:
         await interaction.followup.send(f"⏳ Setting permissions...", ephemeral=True)
@@ -255,7 +242,6 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
         await interaction.edit_original_response(content=msg)
     else:
         await interaction.followup.send(msg, ephemeral=True)
-    
     embed = discord.Embed(title="🎙️ Minecraft Voice Chat", description="กดปุ่มด้านล่างเพื่อเชื่อมต่อ", color=0x2ecc71)
     embed.add_field(name="วิธีการใช้งาน", value="1. กด **Connect** เพื่อใส่ชื่อ\n2. เข้าห้องเสียง **Lobby** เพื่อรอ")
     await interaction.channel.send(embed=embed, view=SetupView())
@@ -282,7 +268,7 @@ async def set_range(i: discord.Interaction, distance: int):
     else:
         await i.response.send_message("❌ Please run /setup first", ephemeral=True)
 
-# --- 🟢 CORE LOGIC: Auto-Move & Bot Join (Testing) 🟢 ---
+# --- 🟢 CORE LOGIC: Auto-Move & Bot Join (Updated) 🟢 ---
 async def process_voice_logic():
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
@@ -321,13 +307,14 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
-        # 🤖 Gather Dummies (Armor Stand)
+        # 🤖 Check for Dummies (Armor Stand)
+        has_dummy_globally = False
         for name, p in game_state.items():
             if name.startswith("botvc"):
                 online.append(("DUMMY", p['x'], p['y'], p['z']))
+                has_dummy_globally = True
 
         if not online: 
-            # ถ้าไม่มีใครอยู่ และบอทค้างในห้อง ให้บอทออก
             if guild.voice_client: await guild.voice_client.disconnect()
             continue
 
@@ -352,11 +339,14 @@ async def process_voice_logic():
         taken = set() 
         groups.sort(key=len, reverse=True)
         
-        bot_target_channel = None # ห้องที่บอทควรจะไปอยู่
+        bot_target_channel = None 
+
+        # ถ้ามีบอท Armor Stand แต่ไม่มีใครเข้ากลุ่มกับมัน (คืออยู่คนเดียว) ให้บอท Discord ไปรอที่ Lobby
+        if has_dummy_globally:
+            bot_target_channel = start
 
         for g in groups:
-            # เช็คว่ากลุ่มนี้มี Dummy (Armor Stand) ไหม
-            has_dummy = any(m == "DUMMY" for m in g)
+            has_dummy_in_group = any(m == "DUMMY" for m in g)
             
             target = None
             room_counts = {}
@@ -368,6 +358,7 @@ async def process_voice_logic():
                 c = m.voice.channel
                 room_counts[c] = room_counts.get(c, 0) + 1
             
+            # ถ้ากลุ่มนี้มีแค่ Dummy (ไม่มีคนจริง) -> ข้ามการหาห้อง (ให้มันใช้ Logic Default คืออยู่ Lobby)
             if not has_real: continue
 
             if not room_counts: majority_channel = start 
@@ -388,8 +379,9 @@ async def process_voice_logic():
             if not target: continue
             taken.add(target.id)
             
-            # ถ้ากลุ่มนี้มี Dummy ให้เซ็ตห้องนี้เป็นห้องที่บอทต้องไป
-            if has_dummy: bot_target_channel = target
+            # ถ้ากลุ่มนี้มี Dummy อยู่ด้วย ให้บอท Discord ย้ายตามไปห้องนี้
+            if has_dummy_in_group: 
+                bot_target_channel = target
             
             # ย้ายคน
             for m in g:
@@ -403,18 +395,19 @@ async def process_voice_logic():
                     except discord.HTTPException as e:
                         if e.status == 429: await asyncio.sleep(2)
         
-        # 4. Bot Movement (Join Voice)
+        # 4. Bot Movement Control
         if bot_target_channel:
-            # ถ้ามีห้องเป้าหมายที่บอทต้องไป
+            # มีห้องต้องไป (Lobby หรือ Game Room)
             if guild.voice_client:
-                # ถ้าเชื่อมต่ออยู่แล้ว แต่ผิดห้อง ให้ย้าย
+                # ถ้าอยู่ผิดห้อง ให้ย้าย
                 if guild.voice_client.channel.id != bot_target_channel.id:
                     await guild.voice_client.move_to(bot_target_channel)
             else:
-                # ถ้ายังไม่เชื่อมต่อ ให้เข้ามาเลย
-                await bot_target_channel.connect()
+                # ถ้ายังไม่เข้า ให้เข้า
+                try: await bot_target_channel.connect()
+                except: pass
         else:
-            # ถ้าไม่มีกลุ่มไหนต้องการบอท (ไม่มี Armor Stand) ให้ออก
+            # ไม่มี Dummy ในโลกเลย -> ออก
             if guild.voice_client:
                 await guild.voice_client.disconnect()
 
