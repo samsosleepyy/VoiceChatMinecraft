@@ -260,9 +260,6 @@ class SetupView(ui.View):
         
         if is_online_in_game:
             status_txt = "🟢 Online (อยู่ในเกม)" 
-            # (Optionally) เพิ่มพิกัดถ้าต้องการ:
-            # coords = game_state[gamertag]
-            # status_txt += f"\n📍 {coords['x']}, {coords['y']}, {coords['z']}"
         else:
             status_txt = "🔴 Offline (ไม่อยู่ในเกม)"
 
@@ -449,6 +446,7 @@ async def process_voice_logic():
                         await asyncio.sleep(0.2)
                     except discord.HTTPException as e:
                         if e.status == 429: await asyncio.sleep(2)
+
 # --- MAIN LOOP ---
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
