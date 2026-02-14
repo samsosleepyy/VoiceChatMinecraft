@@ -157,7 +157,7 @@ class MyBot(commands.Bot):
             for p in data: current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
             
-            # ส่งรายชื่อที่ยืนยันแล้วกลับไป (ป้องกัน Invalid Name ในเกม)
+            # ส่งรายชื่อที่ยืนยันแล้วกลับไป
             verified_names = []
             for g_data in server_data.values():
                 verified_names.extend(g_data.get('users', {}).values())
@@ -262,6 +262,7 @@ async def set_range(i: discord.Interaction, distance: int):
 # --- 🟢 CORE LOGIC: Auto-Move & Disconnect Handling 🟢 ---
 async def process_voice_logic():
     curr = time.time()
+    # ล้าง cooldown เก่าๆ
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
 
     for guild_id, data in server_data.items():
@@ -284,16 +285,14 @@ async def process_voice_logic():
         for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
             if not mem or not mem.voice or not mem.voice.channel: continue
-            # เช็คว่าอยู่ใน Category ของบอทหรือไม่ (ถ้าไม่อยู่ ไม่ต้องยุ่ง)
             if mem.voice.channel.category_id != cat.id: continue
             
-            # ✅ LOGIC 1: เช็คว่าอยู่ในเกมหรือไม่?
+            # LOGIC 1: เช็คว่าอยู่ในเกมหรือไม่?
             if gamertag in game_state:
-                # ยังอยู่ในเกม -> เก็บข้อมูลไว้จัดกลุ่ม
                 p = game_state[gamertag]
                 online.append((mem, p['x'], p['y'], p['z']))
             else:
-                # ❌ ออกจากเกมแล้ว (Disconnect) -> ย้ายกลับ Lobby
+                # ❌ ออกจากเกมแล้ว -> ย้ายกลับ Lobby
                 if mem.voice.channel.id != start.id:
                     if curr - user_last_move.get(mem.id, 0) > MOVE_COOLDOWN:
                         try: 
@@ -302,10 +301,9 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
-        # --- ถ้าไม่มีคนออนไลน์ในเกม ก็จบการทำงานของรอบนี้ ---
         if not online: continue
 
-        # ✅ LOGIC 2: จัดกลุ่มคนเล่น (Clustering)
+        # LOGIC 2: จัดกลุ่มคนเล่น (Clustering)
         groups = []
         processed = set()
         for i in range(len(online)):
@@ -321,9 +319,9 @@ async def process_voice_logic():
                     processed.add(j)
             groups.append(grp)
             
-        # ✅ LOGIC 3: เลือกห้อง (Few-to-Many & Majority Rule)
+        # LOGIC 3: เลือกห้อง (Majority Rule + Separation)
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
-        taken = set()
+        taken = set() # เก็บไอดีห้องที่ถูกจองแล้วในรอบนี้
         
         for g in groups:
             target = None
@@ -332,33 +330,47 @@ async def process_voice_logic():
                 c = m.voice.channel
                 room_counts[c] = room_counts.get(c, 0) + 1
             
-            # หาห้องที่คนส่วนใหญ่อยู่
+            # หาห้องที่คนส่วนใหญ่ในกลุ่มนี้อยู่ (Few to Many)
+            # ถ้าเท่ากัน max จะเลือกอันแรกที่เจอ ซึ่งถือว่าเป็นการสุ่มเลือกได้
+            if not room_counts: continue
             majority_channel = max(room_counts, key=room_counts.get)
             
-            if majority_channel.id == start.id:
-                # กรณี A: คนส่วนใหญ่อยู่ Lobby -> หาห้องว่างห้องใหม่ให้ทุกคน
+            # เงื่อนไขต้องหาห้องใหม่:
+            # 1. คนส่วนใหญ่อยู่ Lobby (Start)
+            # 2. ห้องที่คนส่วนใหญ่อยู่ ถูกกลุ่มอื่นจองไปแล้ว (Separation)
+            need_new_room = (majority_channel.id == start.id) or (majority_channel.id in taken)
+            
+            if need_new_room:
+                # หาห้องว่างจริงๆ (ไม่มีคนอยู่) และยังไม่ถูกจอง
                 for c in avail:
                     if len(c.members) == 0 and c.id not in taken:
                         target = c
                         break
+                
+                # ถ้าไม่มีห้องว่างจริงๆ เอาห้องที่ไม่ถูกจองก็ยังดี
+                if not target:
+                    for c in avail:
+                        if c.id not in taken:
+                            target = c
+                            break
             else:
-                # กรณี B: คนส่วนใหญ่อยู่ห้องเกม -> ย้ายคนส่วนน้อยไปหา (Few to Many)
+                # ห้องเดิมยังว่างสำหรับกลุ่มนี้ -> ใช้ต่อได้
                 target = majority_channel
             
-            if not target:
-                 for c in room_counts:
-                     if c.id != start.id: target = c; break
-            
+            # ถ้าไม่มีห้องเหลือเลย (target is None) -> ทำอะไรไม่ได้ (ปล่อยเบลอ)
             if not target: continue
+            
+            # จองห้องนี้ไว้ ห้ามกลุ่มอื่นมาใช้ในรอบนี้
             taken.add(target.id)
             
+            # ย้ายคนเข้าห้อง (เฉพาะคนที่ยังไม่อยู่)
             for m in g:
                 if m.voice.channel.id != target.id:
                     if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
                     try:
                         await m.move_to(target)
                         user_last_move[m.id] = curr
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.2) # ดีเลย์กัน Rate Limit
                     except discord.HTTPException as e:
                         if e.status == 429: await asyncio.sleep(2)
 
