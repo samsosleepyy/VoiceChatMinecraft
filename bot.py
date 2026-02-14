@@ -20,6 +20,8 @@ MOVE_COOLDOWN = 3.0
 DATA_FILE = "server_data.json"
 
 # --- DATA STORES ---
+# server_data: เก็บข้อมูลถาวร (Whitelist, Config, User Link)
+# game_state: เก็บพิกัด Real-time (รีเซ็ตเมื่อบอทดับ)
 server_data = {}  
 game_state = {}   
 user_last_move = {}
@@ -31,6 +33,7 @@ def load_data():
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 raw_data = json.load(f)
+                # แปลง Key กลับเป็น int เพราะ JSON เก็บ Key เป็น String
                 server_data = {int(k): v for k, v in raw_data.items()}
                 for gid in server_data:
                     if 'users' in server_data[gid]:
@@ -47,6 +50,7 @@ def save_data():
     except Exception as e:
         print(f"⚠️ Save Error: {e}")
 
+# โหลดข้อมูลเมื่อเริ่มบอท
 load_data()
 
 # --- HELPER FUNCTIONS ---
@@ -96,6 +100,7 @@ class MyBot(commands.Bot):
         self.is_rate_limited = False
 
     async def setup_hook(self):
+        # ตั้งค่า Web Server สำหรับรับข้อมูลจาก Minecraft
         app = web.Application()
         app.router.add_post('/update_coords', self.handle_coords)
         app.router.add_get('/', self.handle_index)
@@ -115,7 +120,7 @@ class MyBot(commands.Bot):
 
     async def handle_index(self, request):
         count = sum(1 for g in server_data.values() if g.get('whitelist', {}).get('active'))
-        return web.Response(text=f"Bot Online (Local Mode) | Active Whitelists: {count}")
+        return web.Response(text=f"Bot Online | Active Whitelists: {count}")
 
     async def handle_dashboard(self, request):
         try:
@@ -147,32 +152,31 @@ class MyBot(commands.Bot):
         remove_whitelist(int(data.get('guild_id')))
         return web.HTTPFound('/dashboard')
 
+    # --- 🟢 HANDLE COORDS API 🟢 ---
     async def handle_coords(self, request):
         try:
             data = await request.json()
             global game_state
             
-            # อัปเดตตำแหน่งล่าสุดของผู้เล่นทุกคน
+            # 1. Update Game State (Global)
+            # data structure: [{name: 'Steve', x: 10, y: 60, z: 10}, ...]
             current = {}
-            for p in data: current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
+            for p in data: 
+                current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
             
-            # ส่งรายชื่อที่ยืนยันแล้วกลับไป
-            verified_names = []
-            for g_data in server_data.values():
-                verified_names.extend(g_data.get('users', {}).values())
-            
-            # เรียกฟังก์ชันจัดการห้องเสียง
+            # 2. Trigger Logic
             if not self.is_rate_limited:
                 await process_voice_logic()
             
-            return web.json_response({'status': 'ok', 'verified': list(set(verified_names))})
+            return web.json_response({'status': 'ok'})
         except Exception as e:
             print(f"API Error: {e}")
             return web.json_response({'status': 'error'}, status=500)
 
 bot = MyBot()
 
+# --- SECURITY EVENTS ---
 @bot.event
 async def on_guild_join(guild):
     data = get_guild_data(guild.id)
@@ -191,27 +195,83 @@ async def on_guild_join(guild):
     else:
         update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
 
+# --- UI CLASSES (UPDATED) ---
+
 class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
-    xbox_name = ui.TextInput(label='Xbox Gamertag')
+    xbox_name = ui.TextInput(label='Xbox Gamertag', placeholder='ใส่ชื่อในเกมของคุณ...', min_length=3, max_length=20)
+
     async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
         gamertag = self.xbox_name.value.strip()
+        
         update_user(interaction.guild_id, interaction.user.id, gamertag)
         
         data = get_guild_data(interaction.guild_id)
         cfg = data.get('config', {})
-        msg = f"✅ Saved **{gamertag}**"
+        
+        msg = f"✅ บันทึกชื่อ **{gamertag}** สำเร็จ!"
         if 'start_channel_id' in cfg:
             chan = interaction.guild.get_channel(cfg['start_channel_id'])
-            if chan: msg += f"\n👉 Go to {chan.mention}"
+            if chan: msg += f"\n👉 กรุณาไปรอที่ห้อง: {chan.mention}"
+            
         await interaction.followup.send(msg, ephemeral=True)
 
 class SetupView(ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @ui.button(label="Connect", style=discord.ButtonStyle.green, custom_id="mc_link")
-    async def link(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(LinkModal())
-    @ui.button(label="Edit Name", style=discord.ButtonStyle.gray, custom_id="mc_edit")
-    async def edit(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(LinkModal())
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    # ปุ่ม Connect
+    @ui.button(label="Connect", style=discord.ButtonStyle.green, custom_id="mc_link", emoji="🔗")
+    async def link(self, i: discord.Interaction, b: ui.Button):
+        data = get_guild_data(i.guild_id)
+        users = data.get('users', {})
+        
+        # เช็คว่าเชื่อมต่อแล้วหรือยัง
+        if i.user.id in users:
+            gamertag = users[i.user.id]
+            msg = f"⚠️ คุณเชื่อมต่อไว้แล้วในชื่อ **{gamertag}**\nหากต้องการเปลี่ยนชื่อ ให้กดปุ่ม **📝 Edit Name**"
+            await i.response.send_message(msg, ephemeral=True)
+        else:
+            await i.response.send_modal(LinkModal())
+
+    # ปุ่ม Edit
+    @ui.button(label="Edit Name", style=discord.ButtonStyle.secondary, custom_id="mc_edit", emoji="📝")
+    async def edit(self, i: discord.Interaction, b: ui.Button):
+        await i.response.send_modal(LinkModal())
+
+    # ปุ่ม Status (ใหม่)
+    @ui.button(label="Check Status", style=discord.ButtonStyle.primary, custom_id="mc_status", emoji="📊")
+    async def status(self, i: discord.Interaction, b: ui.Button):
+        data = get_guild_data(i.guild_id)
+        users = data.get('users', {})
+        
+        if i.user.id not in users:
+            return await i.response.send_message("❌ คุณยังไม่ได้เชื่อมต่อบัญชี (กด Connect เพื่อเริ่มใช้งาน)", ephemeral=True)
+
+        gamertag = users[i.user.id]
+        
+        # เช็คว่าตอนนี้ชื่อนี้ออนไลน์ในเกมหรือไม่ (ดูจาก game_state)
+        is_online_in_game = gamertag in game_state
+        
+        # สร้าง Embed แสดงสถานะ
+        embed = discord.Embed(title="📊 ข้อมูลสถานะของคุณ", color=0x3498db)
+        embed.add_field(name="👤 Discord", value=i.user.mention, inline=True)
+        embed.add_field(name="🎮 Gamertag", value=f"**{gamertag}**", inline=True)
+        
+        if is_online_in_game:
+            status_txt = "🟢 Online (อยู่ในเกม)" 
+            # (Optionally) เพิ่มพิกัดถ้าต้องการ:
+            # coords = game_state[gamertag]
+            # status_txt += f"\n📍 {coords['x']}, {coords['y']}, {coords['z']}"
+        else:
+            status_txt = "🔴 Offline (ไม่อยู่ในเกม)"
+
+        embed.add_field(name="Server Status", value=status_txt, inline=False)
+        embed.set_footer(text="Status Updated: Real-time")
+        
+        await i.response.send_message(embed=embed, ephemeral=True)
+
+# --- COMMANDS ---
 
 @bot.tree.command(name="setup")
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
@@ -221,21 +281,28 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
     update_whitelist(interaction.guild_id, interaction.guild.name)
     update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
 
-    msg = "✅ Setup Complete!"
+    msg_status = "✅ Setup Complete!"
     if role:
         await interaction.followup.send(f"⏳ Setting permissions...", ephemeral=True)
         try:
-            for c in category.channels:
-                if c.id == start_channel.id: await c.set_permissions(role, view_channel=True, connect=True)
-                else: await c.set_permissions(role, view_channel=False)
+            await category.set_permissions(role, view_channel=False, connect=False)
+            await start_channel.set_permissions(role, view_channel=True, connect=True)
             if isinstance(interaction.channel, discord.TextChannel):
                  await interaction.channel.set_permissions(role, view_channel=True)
-            msg += "\n✨ Permissions Updated"
-        except: msg += "\n⚠️ Permission Error"
-        await interaction.edit_original_response(content=msg)
+            msg_status += "\n✨ Permissions Updated"
+        except: msg_status += "\n⚠️ Permission Error"
+        await interaction.edit_original_response(content=msg_status)
     else:
-        await interaction.followup.send(msg, ephemeral=True)
-    await interaction.channel.send(embed=discord.Embed(title="Voice Chat", description="Click to Connect", color=0x2ecc71), view=SetupView())
+        await interaction.followup.send(msg_status, ephemeral=True)
+    
+    embed = discord.Embed(
+        title="🎙️ Minecraft Voice Chat", 
+        description="กดปุ่มด้านล่างเพื่อเชื่อมต่อ Discord กับ Minecraft", 
+        color=0x2ecc71
+    )
+    embed.add_field(name="วิธีการใช้งาน", value="1. กด **Connect** เพื่อใส่ชื่อในเกม\n2. เข้าห้องเสียง **Lobby** เพื่อรอ\n3. เมื่อเข้าเกม บอทจะย้ายคุณอัตโนมัติ")
+    
+    await interaction.channel.send(embed=embed, view=SetupView())
 
 @bot.tree.command(name="whitelist")
 async def wl(i: discord.Interaction, server_id: str):
@@ -259,10 +326,10 @@ async def set_range(i: discord.Interaction, distance: int):
     else:
         await i.response.send_message("❌ Please run /setup first", ephemeral=True)
 
-# --- 🟢 CORE LOGIC: Auto-Move & Disconnect Handling 🟢 ---
+# --- 🟢 CORE LOGIC: Auto-Move & Separation 🟢 ---
 async def process_voice_logic():
     curr = time.time()
-    # ล้าง cooldown เก่าๆ
+    # Cleanup Cooldowns
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
 
     for guild_id, data in server_data.items():
@@ -281,18 +348,19 @@ async def process_voice_logic():
         dist_sq = cfg.get('range', DEFAULT_RANGE) ** 2
         users_map = data.get('users', {})
         
+        # 1. Gather Online Users
         online = []
         for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
             if not mem or not mem.voice or not mem.voice.channel: continue
             if mem.voice.channel.category_id != cat.id: continue
             
-            # LOGIC 1: เช็คว่าอยู่ในเกมหรือไม่?
+            # LOGIC: Check In-Game Status
             if gamertag in game_state:
                 p = game_state[gamertag]
                 online.append((mem, p['x'], p['y'], p['z']))
             else:
-                # ❌ ออกจากเกมแล้ว -> ย้ายกลับ Lobby
+                # ❌ Not In Game -> Move to Lobby
                 if mem.voice.channel.id != start.id:
                     if curr - user_last_move.get(mem.id, 0) > MOVE_COOLDOWN:
                         try: 
@@ -303,7 +371,7 @@ async def process_voice_logic():
         
         if not online: continue
 
-        # LOGIC 2: จัดกลุ่มคนเล่น (Clustering)
+        # 2. Clustering (Distance)
         groups = []
         processed = set()
         for i in range(len(online)):
@@ -319,10 +387,14 @@ async def process_voice_logic():
                     processed.add(j)
             groups.append(grp)
             
-        # LOGIC 3: เลือกห้อง (Majority Rule + Separation)
+        # 3. Room Management (Separation Logic)
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
-        taken = set() # เก็บไอดีห้องที่ถูกจองแล้วในรอบนี้
+        taken = set() 
         
+        # เรียงกลุ่มตามขนาด (คนเยอะได้สิทธิ์เลือกก่อน...หรือจะเอาคนน้อยก่อนก็ได้แล้วแต่ Logic)
+        # ปกติคนเยอะมักจะครองห้องเดิมไว้
+        groups.sort(key=len, reverse=True)
+
         for g in groups:
             target = None
             room_counts = {}
@@ -330,50 +402,52 @@ async def process_voice_logic():
                 c = m.voice.channel
                 room_counts[c] = room_counts.get(c, 0) + 1
             
-            # หาห้องที่คนส่วนใหญ่ในกลุ่มนี้อยู่ (Few to Many)
-            # ถ้าเท่ากัน max จะเลือกอันแรกที่เจอ ซึ่งถือว่าเป็นการสุ่มเลือกได้
-            if not room_counts: continue
-            majority_channel = max(room_counts, key=room_counts.get)
+            # หาห้องที่สมาชิกส่วนใหญ่อยู่
+            if not room_counts:
+                # กรณีเพิ่งเข้ามา ยังไม่มีห้อง
+                majority_channel = start 
+            else:
+                majority_channel = max(room_counts, key=room_counts.get)
             
-            # เงื่อนไขต้องหาห้องใหม่:
-            # 1. คนส่วนใหญ่อยู่ Lobby (Start)
-            # 2. ห้องที่คนส่วนใหญ่อยู่ ถูกกลุ่มอื่นจองไปแล้ว (Separation)
+            # เงื่อนไขการหาห้องใหม่:
+            # 1. ส่วนใหญ่อยู่ Lobby (Start)
+            # 2. ห้องเดิมโดนจองโดยกลุ่มอื่นไปแล้ว (Separation)
             need_new_room = (majority_channel.id == start.id) or (majority_channel.id in taken)
             
             if need_new_room:
-                # หาห้องว่างจริงๆ (ไม่มีคนอยู่) และยังไม่ถูกจอง
+                # หาห้องว่างจริงๆ (สมาชิก 0 คน และยังไม่ถูกจอง)
                 for c in avail:
                     if len(c.members) == 0 and c.id not in taken:
                         target = c
                         break
                 
-                # ถ้าไม่มีห้องว่างจริงๆ เอาห้องที่ไม่ถูกจองก็ยังดี
+                # ถ้าไม่มีห้องว่างจริงๆ เอาห้องไหนก็ได้ที่ยังไม่ถูกจอง
                 if not target:
                     for c in avail:
                         if c.id not in taken:
                             target = c
                             break
             else:
-                # ห้องเดิมยังว่างสำหรับกลุ่มนี้ -> ใช้ต่อได้
+                # ใช้ห้องเดิมได้
                 target = majority_channel
             
-            # ถ้าไม่มีห้องเหลือเลย (target is None) -> ทำอะไรไม่ได้ (ปล่อยเบลอ)
             if not target: continue
             
-            # จองห้องนี้ไว้ ห้ามกลุ่มอื่นมาใช้ในรอบนี้
+            # จองห้องนี้ไว้
             taken.add(target.id)
             
-            # ย้ายคนเข้าห้อง (เฉพาะคนที่ยังไม่อยู่)
+            # ย้ายคน
             for m in g:
                 if m.voice.channel.id != target.id:
                     if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
                     try:
                         await m.move_to(target)
                         user_last_move[m.id] = curr
-                        await asyncio.sleep(0.2) # ดีเลย์กัน Rate Limit
+                        await asyncio.sleep(0.2)
                     except discord.HTTPException as e:
                         if e.status == 429: await asyncio.sleep(2)
 
+# --- MAIN LOOP ---
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
     time.sleep(random.randint(5, 10))
