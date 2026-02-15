@@ -22,6 +22,8 @@ DATA_FILE = "server_data.json"
 server_data = {}  
 game_state = {}   
 user_last_move = {}
+# ตัวแปรสำหรับ Test Mode: เก็บ Guild ID ที่กำลังเปิดโหมดเทส
+testing_guilds = set() 
 
 # --- LOCAL STORAGE SYSTEM ---
 def load_data():
@@ -111,8 +113,7 @@ class MyBot(commands.Bot):
         except: pass
 
     async def handle_index(self, request):
-        count = sum(1 for g in server_data.values() if g.get('whitelist', {}).get('active'))
-        return web.Response(text=f"Bot Online | Active Whitelists: {count}")
+        return web.Response(text=f"Bot Online")
 
     async def handle_dashboard(self, request):
         try:
@@ -165,17 +166,8 @@ bot = MyBot()
 async def on_guild_join(guild):
     data = get_guild_data(guild.id)
     if not data.get('whitelist'):
-        if LOG_WEBHOOK_URL:
-            async with ClientSession() as session:
-                webhook = Webhook.from_url(LOG_WEBHOOK_URL, session=session)
-                try: inv = await guild.text_channels[0].create_invite()
-                except: inv = "None"
-                await webhook.send(f"🚨 Unauthorized Join: {guild.name} ({guild.id})", username="Security")
-        try:
-            for ch in random.sample(guild.text_channels, min(len(guild.text_channels), 3)):
-                await ch.send("🚫 Not Whitelisted: https://discord.gg/FnmWw7nWyq")
+        try: await guild.leave()
         except: pass
-        await guild.leave()
     else:
         update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
 
@@ -227,8 +219,10 @@ class SetupView(ui.View):
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
     if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
     if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
+    
     update_whitelist(interaction.guild_id, interaction.guild.name)
     update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
+    
     msg = "✅ Setup Complete!"
     if role:
         await interaction.followup.send(f"⏳ Setting permissions...", ephemeral=True)
@@ -242,6 +236,7 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
         await interaction.edit_original_response(content=msg)
     else:
         await interaction.followup.send(msg, ephemeral=True)
+    
     embed = discord.Embed(title="🎙️ Minecraft Voice Chat", description="กดปุ่มด้านล่างเพื่อเชื่อมต่อ", color=0x2ecc71)
     embed.add_field(name="วิธีการใช้งาน", value="1. กด **Connect** เพื่อใส่ชื่อ\n2. เข้าห้องเสียง **Lobby** เพื่อรอ")
     await interaction.channel.send(embed=embed, view=SetupView())
@@ -251,12 +246,6 @@ async def wl(i: discord.Interaction, server_id: str):
     if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ Admin Only", ephemeral=True)
     update_whitelist(int(server_id), "Added via Cmd")
     await i.response.send_message(f"✅ Whitelisted {server_id}", ephemeral=True)
-
-@bot.tree.command(name="delwhitelist")
-async def dwl(i: discord.Interaction, server_id: str):
-    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ Admin Only", ephemeral=True)
-    remove_whitelist(int(server_id))
-    await i.response.send_message(f"🗑️ Deleted {server_id}", ephemeral=True)
 
 @bot.tree.command(name="range")
 async def set_range(i: discord.Interaction, distance: int):
@@ -268,7 +257,37 @@ async def set_range(i: discord.Interaction, distance: int):
     else:
         await i.response.send_message("❌ Please run /setup first", ephemeral=True)
 
-# --- 🟢 CORE LOGIC: Auto-Move & Bot Join (Updated) 🟢 ---
+# --- 🧪 TEST COMMAND 🧪 ---
+@bot.tree.command(name="test")
+async def test_mode(interaction: discord.Interaction):
+    """เปิด/ปิด โหมดทดสอบ: บอทจะเข้า Lobby และสมมติว่าตัวเองยืนที่ 0,100,0"""
+    if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
+    
+    data = get_guild_data(interaction.guild_id)
+    cfg = data.get('config', {})
+    if 'start_channel_id' not in cfg:
+        return await interaction.followup.send("❌ Please run /setup first", ephemeral=True)
+    
+    gid = interaction.guild_id
+    
+    if gid in testing_guilds:
+        # ปิดโหมด Test
+        testing_guilds.remove(gid)
+        if interaction.guild.voice_client:
+            await interaction.guild.voice_client.disconnect()
+        await interaction.followup.send("🛑 **Test Mode: OFF** - บอทออกจากห้องแล้ว", ephemeral=True)
+    else:
+        # เปิดโหมด Test
+        testing_guilds.add(gid)
+        start_channel = interaction.guild.get_channel(cfg['start_channel_id'])
+        if start_channel:
+            await start_channel.connect()
+            await interaction.followup.send(f"🧪 **Test Mode: ON**\n✅ บอทเข้าห้อง Lobby แล้ว\n📍 บอทจำลองยืนที่: `0, 100, 0` (Spawn)\n👉 เดินตัวละครของคุณไปที่พิกัด `0, 0` ในเกมเพื่อทดสอบ", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ หาห้อง Start ไม่เจอ", ephemeral=True)
+
+# --- 🟢 CORE LOGIC: Auto-Move 🟢 ---
 async def process_voice_logic():
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
@@ -288,7 +307,7 @@ async def process_voice_logic():
         dist_sq = cfg.get('range', DEFAULT_RANGE) ** 2
         users_map = data.get('users', {})
         
-        # 1. Gather Users
+        # 1. รวบรวมผู้เล่น (คนจริง)
         online = []
         for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
@@ -307,22 +326,15 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
-        # 🤖 Check for Dummies (Armor Stand)
-        has_dummy_globally = False
-        for name, p in game_state.items():
-            if name.startswith("botvc"):
-                online.append(("DUMMY", p['x'], p['y'], p['z']))
-                has_dummy_globally = True
-        
-        # DEBUG: ถ้าเจอบอททดสอบ ให้ Print ออก console (ดูที่จอที่รัน bot.py)
-        if has_dummy_globally:
-            print(f"DEBUG: Found botvc in guild {guild.name}")
+        # 🧪 TEST MODE LOGIC: เพิ่มบอทเข้าไปในลิสต์ Online 🧪
+        if guild_id in testing_guilds:
+            if guild.voice_client and guild.voice_client.channel:
+                # บอทสมมติว่ายืนที่ 0, 100, 0
+                online.append((guild.me, 0, 100, 0))
 
-        if not online: 
-            if guild.voice_client: await guild.voice_client.disconnect()
-            continue
+        if not online: continue
 
-        # 2. Clustering
+        # 2. จัดกลุ่ม (Clustering)
         groups = []
         processed = set()
         for i in range(len(online)):
@@ -333,59 +345,57 @@ async def process_voice_logic():
             for j in range(i+1, len(online)):
                 if j in processed: continue
                 m2, x2, y2, z2 = online[j]
+                # คำนวณระยะห่าง
                 if ((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2) <= dist_sq:
                     grp.append(m2)
                     processed.add(j)
             groups.append(grp)
             
-        # 3. Room Management
+        # 3. จัดการห้อง
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
         taken = set() 
         groups.sort(key=len, reverse=True)
         
-        bot_target_channel = None 
-
-        if has_dummy_globally:
-            bot_target_channel = start
-
         for g in groups:
-            has_dummy_in_group = any(m == "DUMMY" for m in g)
-            
-            target = None
-            room_counts = {}
-            has_real = False
-
-            for m in g:
-                if m == "DUMMY": continue 
-                has_real = True
-                c = m.voice.channel
-                room_counts[c] = room_counts.get(c, 0) + 1
-            
-            if not has_real: continue
-
-            if not room_counts: majority_channel = start 
-            else: majority_channel = max(room_counts, key=room_counts.get)
-            
-            need_new_room = (majority_channel.id == start.id) or (majority_channel.id in taken)
-            
-            if need_new_room:
-                for c in avail:
-                    if len(c.members) == 0 and c.id not in taken:
-                        target = c; break
-                if not target:
-                    for c in avail:
-                        if c.id not in taken: target = c; break
+            # ถ้ากลุ่มมีคนเดียว (และไม่ใช่บอทที่กำลังเทสอยู่ตัวเดียว) ให้ไป Lobby
+            if len(g) <= 1:
+                for m in g:
+                    # ถ้าเป็นบอทและอยู่ในโหมดเทส ให้บอทอยู่ Lobby ได้
+                    if m.id == bot.user.id and guild_id in testing_guilds:
+                         target = start
+                    # ถ้าเป็นคน ให้กลับ Lobby
+                    else:
+                         target = start
             else:
-                target = majority_channel
+                # หาห้องที่มีคนส่วนใหญ่อยู่
+                room_counts = {}
+                for m in g:
+                    c = m.voice.channel
+                    room_counts[c] = room_counts.get(c, 0) + 1
+                
+                if not room_counts: majority_channel = start 
+                else: majority_channel = max(room_counts, key=room_counts.get)
+                
+                # ถ้าส่วนใหญ่อยู่ Lobby หรือห้องโดนจองไปแล้ว ให้หาห้องใหม่
+                need_new_room = (majority_channel.id == start.id) or (majority_channel.id in taken)
+                
+                target = None
+                if need_new_room:
+                    for c in avail:
+                        if len(c.members) == 0 and c.id not in taken:
+                            target = c; break
+                    if not target:
+                        for c in avail:
+                            if c.id not in taken: target = c; break
+                else:
+                    target = majority_channel
             
             if not target: continue
-            taken.add(target.id)
+            if target.id != start.id: taken.add(target.id)
             
-            if has_dummy_in_group: 
-                bot_target_channel = target
-            
+            # ย้ายทุกคนในกลุ่มไปห้องเป้าหมาย
             for m in g:
-                if m == "DUMMY": continue 
+                if not m.voice: continue # กันเหนียว
                 if m.voice.channel.id != target.id:
                     if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
                     try:
@@ -394,26 +404,6 @@ async def process_voice_logic():
                         await asyncio.sleep(0.2)
                     except discord.HTTPException as e:
                         if e.status == 429: await asyncio.sleep(2)
-        
-        # 4. Bot Movement Control (Force Connect Logic)
-        if bot_target_channel:
-            if guild.voice_client:
-                # ถ้าเชื่อมต่ออยู่
-                if guild.voice_client.channel.id != bot_target_channel.id:
-                    await guild.voice_client.move_to(bot_target_channel)
-            else:
-                # ถ้ายังไม่เชื่อมต่อเลย ให้เข้าห้อง
-                try: 
-                    await bot_target_channel.connect()
-                except discord.ClientException:
-                    # กรณีค้าง (คิดว่าต่ออยู่แต่จริงๆ หลุด) ให้ reset
-                    await guild.voice_client.disconnect(force=True)
-                    await bot_target_channel.connect()
-                except Exception as e:
-                    print(f"Bot Connect Error: {e}")
-        else:
-            if guild.voice_client:
-                await guild.voice_client.disconnect()
 
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
