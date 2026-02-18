@@ -24,36 +24,38 @@ game_state = {}
 user_last_move = {}
 testing_guilds = set()
 DYNAMIC_RANGE = DEFAULT_RANGE
-active_calls = {} # เก็บสถานะคู่สาย { "playerA": "playerB", "playerB": "playerA" }
+active_calls = {} # เก็บสถานะคู่สาย { "gamertag1": "gamertag2" }
 
-# --- LOCAL STORAGE SYSTEM ---
+# --- LOCAL STORAGE SYSTEM (ROBUST VERSION) ---
 def load_data():
     global server_data
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 raw_data = json.load(f)
-                server_data = {int(k): v for k, v in raw_data.items()}
+                # แปลง Key กลับเป็น int (Guild ID)
+                temp_data = {int(k): v for k, v in raw_data.items()}
                 
-                # --- ส่วนที่เพิ่มมาเพื่อกัน Error ---
-                for gid in server_data:
-                    if 'users' in server_data[gid]:
+                # --- 🛡️ DATA MIGRATION FIX (กันบอทดับ) ---
+                for gid, gdata in temp_data.items():
+                    if 'users' in gdata:
                         new_users = {}
-                        for uid, data in server_data[gid]['users'].items():
-                            # เช็คว่าข้อมูลเป็นแบบเก่า (String) หรือไม่?
-                            if isinstance(data, str):
-                                # ถ้าเป็นแบบเก่า ให้แปลงเป็นแบบใหม่ (ใส่ IC Name ว่า Unknown ไปก่อน)
-                                new_users[int(uid)] = {'gamertag': data, 'ic_name': data}
-                            else:
-                                # ถ้าเป็นแบบใหม่แล้วก็ใช้ได้เลย
-                                new_users[int(uid)] = data
-                        server_data[gid]['users'] = new_users
-                # --------------------------------
+                        for uid, udata in gdata['users'].items():
+                            # ถ้าเป็นข้อมูลเก่า (String) -> แปลงเป็น Dict
+                            if isinstance(udata, str):
+                                new_users[int(uid)] = {'gamertag': udata, 'ic_name': udata}
+                            # ถ้าเป็นข้อมูลใหม่ (Dict) -> ใช้ได้เลย
+                            elif isinstance(udata, dict):
+                                new_users[int(uid)] = udata
+                        
+                        gdata['users'] = new_users # อัปเดตกลับเข้าไป
                 
+                server_data = temp_data
             print(f"✅ Loaded Data: {len(server_data)} Servers")
         except Exception as e:
-            print(f"⚠️ Load Error (Resetting Data): {e}")
-            server_data = {} # ถ้าอ่านไม่ได้ ให้รีเซ็ตใหม่เลย กันบอทดับ
+            print(f"⚠️ Load Error (Data Reset): {e}")
+            server_data = {} # ถ้าไฟล์เสียจริงๆ ให้รีเซ็ตใหม่เพื่อกันดับ
+
 def save_data():
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -61,7 +63,7 @@ def save_data():
     except Exception as e:
         print(f"⚠️ Save Error: {e}")
 
-load_data()
+load_data() # โหลดข้อมูลทันทีเมื่อเริ่ม
 
 def get_guild_data(guild_id):
     if guild_id not in server_data:
@@ -90,7 +92,6 @@ def update_config(guild_id, category_id, start_channel_id, range_val):
     data['config'] = {'category_id': category_id, 'start_channel_id': start_channel_id, 'range': range_val}
     save_data()
 
-# อัปเดตข้อมูลผู้ใช้ (Gamertag + IC Name)
 def update_user(guild_id, user_id, gamertag, ic_name):
     data = get_guild_data(guild_id)
     if 'users' not in data: data['users'] = {}
@@ -128,15 +129,25 @@ class MyBot(commands.Bot):
 
     async def handle_index(self, request):
         return web.Response(text=f"Bot Online")
-    
-    # ... (Dashboard Handlers คงเดิม ละไว้เพื่อความสั้น) ...
-    async def handle_dashboard(self, request): return web.Response(text="Dashboard Active")
-    async def handle_dash_add(self, request): return web.Response(text="OK")
-    async def handle_dash_remove(self, request): return web.Response(text="OK")
-    async def handle_dash_toggle(self, request): return web.Response(text="OK")
-    async def check_pass(self, data): return True
 
-    # --- 🟢 HANDLE COORDS API (UPDATED) 🟢 ---
+    async def handle_dashboard(self, request):
+        try:
+            whitelist_flat = {str(gid): d.get('whitelist') for gid, d in server_data.items() if d.get('whitelist')}
+            env = Environment(loader=FileSystemLoader('templates'))
+            # เช็คว่ามีโฟลเดอร์ templates ไหม (กันแครช)
+            if not os.path.exists('templates/dashboard.html'):
+                 return web.Response(text="Template not found", status=404)
+            template = env.get_template('dashboard.html')
+            rendered = template.render(whitelist=whitelist_flat, password=DASHBOARD_PASSWORD)
+            return web.Response(text=rendered, content_type='text/html')
+        except Exception as e: return web.Response(text=str(e), status=500)
+
+    async def check_pass(self, data): return data.get('password') == DASHBOARD_PASSWORD
+    async def handle_dash_toggle(self, request): return web.HTTPFound('/dashboard')
+    async def handle_dash_add(self, request): return web.HTTPFound('/dashboard')
+    async def handle_dash_remove(self, request): return web.HTTPFound('/dashboard')
+
+    # --- 🟢 HANDLE COORDS API 🟢 ---
     async def handle_coords(self, request):
         try:
             data = await request.json()
@@ -145,45 +156,46 @@ class MyBot(commands.Bot):
             global active_calls
 
             user_list = []
-            server_calls = [] # รายชื่อคนที่กำลังโทรหากัน (Connected)
+            server_calls = [] 
 
+            # รับข้อมูลแบบยืดหยุ่น (กัน Error)
             if isinstance(data, dict):
                 user_list = data.get('users', [])
                 received_range = data.get('range')
                 if received_range: DYNAMIC_RANGE = int(received_range)
-                server_calls = data.get('calls', []) # รับสถานะการโทรจาก Addon
+                server_calls = data.get('calls', []) 
+            elif isinstance(data, list): # เผื่อ Addon เก่าส่งมา
+                user_list = data
 
+            # อัปเดต Game State
             current = {}
-            # สร้าง Map IC Name กลับไปให้ Addon
-            # Format: { "Gamertag": "IC Name" }
-            ic_map = {}
-            
-            # อัปเดตสายที่กำลังโทร
-            active_calls.clear()
-            for c in server_calls:
-                # c = { "p1": "Gamertag1", "p2": "Gamertag2" }
-                active_calls[c['p1']] = c['p2']
-                active_calls[c['p2']] = c['p1']
-
-            # ค้นหา IC Name จาก Database
-            # วิธีนี้อาจจะช้าถ้ายูสเซอร์เยอะ แต่สำหรับเซิร์ฟย่อยโอเค
-            # เราจะส่ง IC Map ของ "ทุกคนที่ลงทะเบียนไว้" ไปให้ Addon (เพื่อให้เลือกรายชื่อโทรได้)
-            
-            all_registered_users = {}
-            for gid, gdata in server_data.items():
-                for uid, udata in gdata.get('users', {}).items():
-                    # udata = {'gamertag': 'xxx', 'ic_name': 'yyy'}
-                    all_registered_users[udata['gamertag']] = udata['ic_name']
-
             for p in user_list: 
                 current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
             
+            # อัปเดต Active Calls (รับมาจาก Addon ว่าใครคุยกับใคร)
+            active_calls.clear()
+            for c in server_calls:
+                # c = { "p1": "Gamertag1", "p2": "Gamertag2" }
+                p1, p2 = c.get('p1'), c.get('p2')
+                if p1 and p2:
+                    active_calls[p1] = p2
+                    active_calls[p2] = p1
+
+            # เตรียม Map IC Name ส่งกลับไปให้ Addon
+            all_ic_map = {}
+            for gid, gdata in server_data.items():
+                for uid, udata in gdata.get('users', {}).items():
+                    # เช็คอีกทีว่าเป็น Dict ไหม (เพื่อความชัวร์)
+                    if isinstance(udata, dict):
+                        all_ic_map[udata['gamertag']] = udata['ic_name']
+                    elif isinstance(udata, str): # Fallback
+                        all_ic_map[udata] = udata
+
             if not self.is_rate_limited:
                 await process_voice_logic()
             
-            # ส่ง IC Map กลับไปให้ Addon ใช้แสดงผล
-            return web.json_response({'status': 'ok', 'ic_map': all_registered_users})
+            return web.json_response({'status': 'ok', 'ic_map': all_ic_map})
             
         except Exception as e:
             print(f"API Error: {e}")
@@ -191,9 +203,14 @@ class MyBot(commands.Bot):
 
 bot = MyBot()
 
-# ... (Event on_guild_join คงเดิม) ...
 @bot.event
-async def on_guild_join(guild): pass # ละไว้
+async def on_guild_join(guild):
+    data = get_guild_data(guild.id)
+    if not data.get('whitelist'):
+        try: await guild.leave()
+        except: pass
+    else:
+        update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
 
 class LinkModal(ui.Modal, title='ลงทะเบียน Voice Chat'):
     xbox_name = ui.TextInput(label='Xbox Gamertag', placeholder='ชื่อในเกม Minecraft...', min_length=3, max_length=20)
@@ -227,9 +244,10 @@ class SetupView(ui.View):
         if i.user.id not in users:
             return await i.response.send_message("❌ คุณยังไม่ได้ลงทะเบียน", ephemeral=True)
         
-        udata = users[i.user.id] # {'gamertag': '...', 'ic_name': '...'}
-        gamertag = udata['gamertag']
-        ic = udata['ic_name']
+        udata = users[i.user.id]
+        # รองรับข้อมูลเก่า (String)
+        gamertag = udata if isinstance(udata, str) else udata['gamertag']
+        ic = udata if isinstance(udata, str) else udata['ic_name']
         is_online = gamertag in game_state
         
         embed = discord.Embed(title="📊 ข้อมูลผู้ใช้", color=0x3498db)
@@ -238,11 +256,11 @@ class SetupView(ui.View):
         embed.add_field(name="สถานะ", value="🟢 Online" if is_online else "🔴 Offline", inline=False)
         await i.response.send_message(embed=embed, ephemeral=True)
 
-# ... (Commands setup, wl, range, test คงเดิม) ...
 @bot.tree.command(name="setup")
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
-    # (Setup logic แบบเดิมแต่เปลี่ยน View เป็นตัวใหม่)
-    await interaction.response.defer(ephemeral=True)
+    if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
+    
     update_whitelist(interaction.guild_id, interaction.guild.name)
     update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
     
@@ -250,16 +268,40 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
     await interaction.channel.send(embed=embed, view=SetupView())
     await interaction.followup.send("✅ Setup Complete", ephemeral=True)
 
+@bot.tree.command(name="whitelist")
+async def wl(i: discord.Interaction, server_id: str):
+    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ Admin Only", ephemeral=True)
+    update_whitelist(int(server_id), "Added via Cmd")
+    await i.response.send_message(f"✅ Whitelisted {server_id}", ephemeral=True)
+
+@bot.tree.command(name="range")
+async def set_range(i: discord.Interaction, distance: int):
+    data = get_guild_data(i.guild_id)
+    cfg = data.get('config', {})
+    if 'category_id' in cfg:
+        update_config(i.guild_id, cfg['category_id'], cfg['start_channel_id'], distance)
+        await i.response.send_message(f"🔊 Range set to {distance}", ephemeral=True)
+    else:
+        await i.response.send_message("❌ Please run /setup first", ephemeral=True)
+
 @bot.tree.command(name="test")
 async def test_mode(interaction: discord.Interaction):
-    # (Logic เดิม)
-    pass
+    if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
+    gid = interaction.guild_id
+    if gid in testing_guilds:
+        testing_guilds.remove(gid)
+        if interaction.guild.voice_client: await interaction.guild.voice_client.disconnect()
+        await interaction.followup.send("🛑 **Test Mode: OFF**", ephemeral=True)
+    else:
+        testing_guilds.add(gid)
+        await interaction.followup.send("🧪 **Test Mode: ON**", ephemeral=True)
 
-# --- 🟢 CORE LOGIC (PHONE & PROXIMITY) 🟢 ---
+# --- 🟢 CORE LOGIC 🟢 ---
 async def process_voice_logic():
     curr = time.time()
-    # Cleanup logic...
-    
+    for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
+
     for guild_id, data in server_data.items():
         if not data.get('whitelist', {}).get('active'): continue
         cfg = data.get('config', {})
@@ -278,38 +320,36 @@ async def process_voice_logic():
         
         users_map = data.get('users', {})
         
-        # 1. รวบรวมคน & แยกคนโทรศัพท์
         online = []
-        in_call_users = set() # เก็บ User ID คนที่โทรอยู่
-        
-        # Mapping Gamertag -> Member Object
+        in_call_users = set()
         tag_to_member = {}
 
+        # 1. รวบรวมสมาชิก
         for uid, udata in users_map.items():
-            gamertag = udata['gamertag']
+            # รองรับข้อมูลเก่า/ใหม่
+            gamertag = udata if isinstance(udata, str) else udata['gamertag']
+            
             mem = guild.get_member(uid)
             if not mem or not mem.voice: continue
             if mem.voice.channel.category_id != cat.id: continue
             
             tag_to_member[gamertag] = mem
 
-            # เช็คว่าคนนี้อยู่ในสายไหม
+            # เช็คว่าอยู่ในสายโทรศัพท์ไหม?
             if gamertag in active_calls:
                 in_call_users.add(uid)
-                # Logic การโทรจะจัดการแยกต่างหาก
-                continue
+                continue # แยกไปจัดการใน Phone Logic
             
             if gamertag in game_state:
                 p = game_state[gamertag]
                 online.append((mem, p['x'], p['y'], p['z']))
             else:
-                # กลับ Lobby
                 if mem.voice.channel.id != start.id:
                     if curr - user_last_move.get(mem.id, 0) > MOVE_COOLDOWN:
                         try: await mem.move_to(start)
                         except: pass
 
-        # --- 📞 PHONE LOGIC (ย้ายคู่สายไปห้องส่วนตัว) ---
+        # --- 📞 PHONE LOGIC ---
         processed_calls = set()
         taken_rooms = set()
 
@@ -320,39 +360,32 @@ async def process_voice_logic():
             m2 = tag_to_member.get(tag2)
             
             if m1 and m2:
-                # หาห้องว่างให้คู่นี้
                 target_room = None
-                
-                # ถ้าทั้งคู่อยู่ห้องเดียวกันและห้องนั้นไม่มีคนอื่น -> ใช้ห้องเดิม
+                # ถ้าอยู่ด้วยกันแล้ว 2 คน
                 if m1.voice.channel.id == m2.voice.channel.id:
-                    # เช็คว่าห้องนี้มีคนอื่นปนไหม
                     if len(m1.voice.channel.members) == 2:
                         target_room = m1.voice.channel
                 
-                # ถ้ายังไม่มีห้อง หรือห้องไม่ส่วนตัว -> หาห้องใหม่
+                # ถ้ายังไม่ได้ที่ -> หาห้องว่าง
                 if not target_room:
                     avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
                     for c in avail:
                         if len(c.members) == 0 and c.id not in taken_rooms:
-                            target_room = c
-                            break
+                            target_room = c; break
                 
                 if target_room:
                     taken_rooms.add(target_room.id)
                     processed_calls.add(tag1)
                     processed_calls.add(tag2)
-                    
                     for m in [m1, m2]:
                         if m.voice.channel.id != target_room.id:
                             try: await m.move_to(target_room)
                             except: pass
-        
-        # --- 🌐 PROXIMITY LOGIC (คนปกติ) ---
-        # (เหมือนเดิมเป๊ะ แต่ข้ามคนใน in_call_users)
-        
+
+        # --- 🌐 PROXIMITY LOGIC (NORMAL) ---
         if not online: continue
 
-        # 2. จัดกลุ่ม
+        # Grouping
         groups = []
         processed = set()
         for i in range(len(online)):
@@ -372,7 +405,7 @@ async def process_voice_logic():
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
         
         for g in groups:
-            # (Logic เดิมของคุณ: คนเยอะครองห้อง คนน้อยย้าย)
+            # Majority Rule
             room_counts = {}
             for m in g:
                 if m.voice.channel:
@@ -406,3 +439,17 @@ async def process_voice_logic():
                         user_last_move[m.id] = curr
                         await asyncio.sleep(0.2)
                     except: pass
+
+if __name__ == "__main__":
+    if not TOKEN: sys.exit(1)
+    time.sleep(random.randint(5, 10))
+    while True:
+        try:
+            bot.is_rate_limited = False
+            bot.run(TOKEN)
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                bot.is_rate_limited = True
+                time.sleep(60)
+            else: time.sleep(10)
+        except: time.sleep(30)
