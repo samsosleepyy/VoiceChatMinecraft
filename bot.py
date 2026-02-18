@@ -34,15 +34,26 @@ def load_data():
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 raw_data = json.load(f)
                 server_data = {int(k): v for k, v in raw_data.items()}
-                # แปลง User ID กลับเป็น int
+                
+                # --- ส่วนที่เพิ่มมาเพื่อกัน Error ---
                 for gid in server_data:
                     if 'users' in server_data[gid]:
-                        server_data[gid]['users'] = {int(uid): data for uid, data in server_data[gid]['users'].items()}
+                        new_users = {}
+                        for uid, data in server_data[gid]['users'].items():
+                            # เช็คว่าข้อมูลเป็นแบบเก่า (String) หรือไม่?
+                            if isinstance(data, str):
+                                # ถ้าเป็นแบบเก่า ให้แปลงเป็นแบบใหม่ (ใส่ IC Name ว่า Unknown ไปก่อน)
+                                new_users[int(uid)] = {'gamertag': data, 'ic_name': data}
+                            else:
+                                # ถ้าเป็นแบบใหม่แล้วก็ใช้ได้เลย
+                                new_users[int(uid)] = data
+                        server_data[gid]['users'] = new_users
+                # --------------------------------
+                
             print(f"✅ Loaded Data: {len(server_data)} Servers")
         except Exception as e:
-            print(f"⚠️ Load Error: {e}")
-            server_data = {}
-
+            print(f"⚠️ Load Error (Resetting Data): {e}")
+            server_data = {} # ถ้าอ่านไม่ได้ ให้รีเซ็ตใหม่เลย กันบอทดับ
 def save_data():
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
