@@ -15,14 +15,17 @@ from jinja2 import Environment, FileSystemLoader
 TOKEN = os.getenv("DISCORD_TOKEN")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASS", "admin1234") 
 LOG_WEBHOOK_URL = os.getenv("LOG_WEBHOOK_URL", "") 
-DEFAULT_RANGE = 10
-MOVE_COOLDOWN = 3.0
+DEFAULT_RANGE = 10 # ค่าสำรอง
 DATA_FILE = "server_data.json"
+MOVE_COOLDOWN = 3.0
 
 server_data = {}  
 game_state = {}   
 user_last_move = {}
-testing_guilds = set() # เก็บ ID เซิร์ฟเวอร์ที่เปิดโหมดเทส
+testing_guilds = set()
+
+# ตัวแปร Global สำหรับเก็บระยะที่รับมาจาก Minecraft
+DYNAMIC_RANGE = DEFAULT_RANGE 
 
 # --- LOCAL STORAGE SYSTEM ---
 def load_data():
@@ -144,16 +147,35 @@ class MyBot(commands.Bot):
         remove_whitelist(int(data.get('guild_id')))
         return web.HTTPFound('/dashboard')
 
+    # --- 🟢 HANDLE COORDS API (UPDATED) 🟢 ---
     async def handle_coords(self, request):
         try:
             data = await request.json()
             global game_state
+            global DYNAMIC_RANGE
+
+            # รองรับข้อมูลทั้งแบบเก่า (List) และแบบใหม่ (Dict มี range)
+            user_list = []
+            
+            if isinstance(data, list):
+                # แบบเก่า: ส่งมาแค่ List ของคน
+                user_list = data
+            elif isinstance(data, dict):
+                # แบบใหม่: มี users และ range
+                user_list = data.get('users', [])
+                received_range = data.get('range')
+                if received_range:
+                    DYNAMIC_RANGE = int(received_range)
+
+            # อัปเดต Game State
             current = {}
-            for p in data: 
+            for p in user_list: 
                 current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
+            
             if not self.is_rate_limited:
                 await process_voice_logic()
+            
             return web.json_response({'status': 'ok'})
         except Exception as e:
             print(f"API Error: {e}")
@@ -248,15 +270,15 @@ async def wl(i: discord.Interaction, server_id: str):
 
 @bot.tree.command(name="range")
 async def set_range(i: discord.Interaction, distance: int):
+    # คำสั่งนี้จะเปลี่ยนค่าใน Config ถาวร แต่ค่าจาก Minecraft (ถ้าเปิดอยู่) จะทับค่านี้ชั่วคราว
     data = get_guild_data(i.guild_id)
     cfg = data.get('config', {})
     if 'category_id' in cfg:
         update_config(i.guild_id, cfg['category_id'], cfg['start_channel_id'], distance)
-        await i.response.send_message(f"🔊 Range set to {distance}", ephemeral=True)
+        await i.response.send_message(f"🔊 ตั้งค่า Range พื้นฐานเป็น {distance} (จะถูกทับหากมีการตั้งค่าในเกม)", ephemeral=True)
     else:
         await i.response.send_message("❌ Please run /setup first", ephemeral=True)
 
-# --- 🧪 TEST COMMAND 🧪 ---
 @bot.tree.command(name="test")
 async def test_mode(interaction: discord.Interaction):
     """เปิด/ปิด โหมดทดสอบ: บอทจะตาม Armor Stand ชื่อ botvc"""
@@ -274,7 +296,7 @@ async def test_mode(interaction: discord.Interaction):
         testing_guilds.add(gid)
         await interaction.followup.send("🧪 **Test Mode: ON**\n1. เสก Armor Stand ชื่อ `botvc` ในเกม\n2. บอทจะเข้ามาในห้องและอยู่ที่ตำแหน่งของ Armor Stand นั้น", ephemeral=True)
 
-# --- 🟢 CORE LOGIC 🟢 ---
+# --- 🟢 CORE LOGIC (UPDATED WITH DYNAMIC RANGE) 🟢 ---
 async def process_voice_logic():
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
@@ -291,10 +313,18 @@ async def process_voice_logic():
         start = guild.get_channel(cfg.get('start_channel_id'))
         if not cat or not start: continue
         
-        dist_sq = cfg.get('range', DEFAULT_RANGE) ** 2
+        # 🔥 ใช้ระยะที่ได้รับมาจากเกม (DYNAMIC_RANGE) หรือถ้าไม่มีให้ใช้ค่าเดิมใน config
+        # ถ้าค่าใน config ไม่มี ให้ใช้ DEFAULT_RANGE (10)
+        config_range = cfg.get('range', DEFAULT_RANGE)
+        
+        # เลือกใช้ค่าที่มากกว่าระหว่าง DYNAMIC_RANGE กับ 0 (เพื่อให้แน่ใจว่าค่าถูกต้อง)
+        # หมายเหตุ: DYNAMIC_RANGE จะถูกอัปเดตทุกครั้งที่ main.js ส่งข้อมูลมา
+        active_range = DYNAMIC_RANGE if DYNAMIC_RANGE > 0 else config_range
+        
+        dist_sq = active_range ** 2
+        
         users_map = data.get('users', {})
         
-        # 1. รวบรวมผู้เล่นจริง
         online = []
         for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
@@ -313,24 +343,18 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
-        # 🧪 TEST MODE: เช็ค botvc 🧪
-        bot_target_channel = None # ห้องที่บอทควรจะอยู่
+        bot_target_channel = None 
         
         if guild_id in testing_guilds:
-            # หา armor stand ชื่อ botvc ใน game_state
             found_botvc = False
             for name, p in game_state.items():
                 if name.startswith("botvc"):
-                    # เจอแล้ว! บอท Discord (guild.me) จะอยู่ที่พิกัดนี้
                     online.append((guild.me, p['x'], p['y'], p['z']))
                     found_botvc = True
-                    break # เอาตัวแรกที่เจอ
+                    break 
             
-            # ถ้าไม่เจอ botvc และบอทอยู่ในห้อง -> ให้ออก
             if not found_botvc:
                 if guild.voice_client: await guild.voice_client.disconnect()
-                # ถ้าไม่เจอ ก็จบการทำงานของบอทแค่นี้ (ไป process คนอื่นต่อ)
-                # แต่ถ้า online ว่างเปล่า ก็ continue ได้เลย
                 if not online: continue
         
         if not online: continue
@@ -357,15 +381,11 @@ async def process_voice_logic():
         groups.sort(key=len, reverse=True)
         
         for g in groups:
-            # --- Logic การย้ายห้อง ---
-            # ถ้ากลุ่มมีคนเดียว (แยกกันอยู่) -> ไป Lobby
             if len(g) <= 1:
                 target = start
             else:
-                # ถ้ากลุ่ม > 1 คน -> หาห้องคุย
                 room_counts = {}
                 for m in g:
-                    # บอท Discord อาจจะยังไม่มี voice channel (ถ้าเพิ่งเข้า)
                     if m.voice and m.voice.channel:
                         c = m.voice.channel
                         room_counts[c] = room_counts.get(c, 0) + 1
@@ -389,12 +409,9 @@ async def process_voice_logic():
             if not target: continue
             if target.id != start.id: taken.add(target.id)
             
-            # ย้ายทุกคนในกลุ่ม
             for m in g:
-                # ถ้าเป็นบอท Discord ตัวเอง
                 if m.id == bot.user.id:
                     bot_target_channel = target
-                # ถ้าเป็นคน
                 elif m.voice:
                     if m.voice.channel.id != target.id:
                         if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
@@ -405,13 +422,11 @@ async def process_voice_logic():
                         except discord.HTTPException as e:
                             if e.status == 429: await asyncio.sleep(2)
 
-        # 4. ย้ายบอท Discord (ถ้ามีเป้าหมาย)
         if bot_target_channel and guild_id in testing_guilds:
             if guild.voice_client:
                 if guild.voice_client.channel.id != bot_target_channel.id:
                     await guild.voice_client.move_to(bot_target_channel)
             else:
-                # Force Connect
                 try: await bot_target_channel.connect()
                 except discord.ClientException:
                      await guild.voice_client.disconnect(force=True)
