@@ -15,7 +15,7 @@ from jinja2 import Environment, FileSystemLoader
 TOKEN = os.getenv("DISCORD_TOKEN")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASS", "admin1234") 
 LOG_WEBHOOK_URL = os.getenv("LOG_WEBHOOK_URL", "") 
-DEFAULT_RANGE = 10 # ค่าสำรอง
+DEFAULT_RANGE = 10
 DATA_FILE = "server_data.json"
 MOVE_COOLDOWN = 3.0
 
@@ -23,8 +23,6 @@ server_data = {}
 game_state = {}   
 user_last_move = {}
 testing_guilds = set()
-
-# ตัวแปร Global สำหรับเก็บระยะที่รับมาจาก Minecraft
 DYNAMIC_RANGE = DEFAULT_RANGE 
 
 # --- LOCAL STORAGE SYSTEM ---
@@ -147,27 +145,21 @@ class MyBot(commands.Bot):
         remove_whitelist(int(data.get('guild_id')))
         return web.HTTPFound('/dashboard')
 
-    # --- 🟢 HANDLE COORDS API (UPDATED) 🟢 ---
     async def handle_coords(self, request):
         try:
             data = await request.json()
             global game_state
             global DYNAMIC_RANGE
 
-            # รองรับข้อมูลทั้งแบบเก่า (List) และแบบใหม่ (Dict มี range)
             user_list = []
-            
             if isinstance(data, list):
-                # แบบเก่า: ส่งมาแค่ List ของคน
                 user_list = data
             elif isinstance(data, dict):
-                # แบบใหม่: มี users และ range
                 user_list = data.get('users', [])
                 received_range = data.get('range')
                 if received_range:
                     DYNAMIC_RANGE = int(received_range)
 
-            # อัปเดต Game State
             current = {}
             for p in user_list: 
                 current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
@@ -270,7 +262,6 @@ async def wl(i: discord.Interaction, server_id: str):
 
 @bot.tree.command(name="range")
 async def set_range(i: discord.Interaction, distance: int):
-    # คำสั่งนี้จะเปลี่ยนค่าใน Config ถาวร แต่ค่าจาก Minecraft (ถ้าเปิดอยู่) จะทับค่านี้ชั่วคราว
     data = get_guild_data(i.guild_id)
     cfg = data.get('config', {})
     if 'category_id' in cfg:
@@ -296,7 +287,7 @@ async def test_mode(interaction: discord.Interaction):
         testing_guilds.add(gid)
         await interaction.followup.send("🧪 **Test Mode: ON**\n1. เสก Armor Stand ชื่อ `botvc` ในเกม\n2. บอทจะเข้ามาในห้องและอยู่ที่ตำแหน่งของ Armor Stand นั้น", ephemeral=True)
 
-# --- 🟢 CORE LOGIC (UPDATED WITH DYNAMIC RANGE) 🟢 ---
+# --- 🟢 CORE LOGIC (STRICT FEW-TO-MANY) 🟢 ---
 async def process_voice_logic():
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
@@ -313,18 +304,13 @@ async def process_voice_logic():
         start = guild.get_channel(cfg.get('start_channel_id'))
         if not cat or not start: continue
         
-        # 🔥 ใช้ระยะที่ได้รับมาจากเกม (DYNAMIC_RANGE) หรือถ้าไม่มีให้ใช้ค่าเดิมใน config
-        # ถ้าค่าใน config ไม่มี ให้ใช้ DEFAULT_RANGE (10)
         config_range = cfg.get('range', DEFAULT_RANGE)
-        
-        # เลือกใช้ค่าที่มากกว่าระหว่าง DYNAMIC_RANGE กับ 0 (เพื่อให้แน่ใจว่าค่าถูกต้อง)
-        # หมายเหตุ: DYNAMIC_RANGE จะถูกอัปเดตทุกครั้งที่ main.js ส่งข้อมูลมา
         active_range = DYNAMIC_RANGE if DYNAMIC_RANGE > 0 else config_range
-        
         dist_sq = active_range ** 2
         
         users_map = data.get('users', {})
         
+        # 1. รวบรวมคน
         online = []
         for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
@@ -335,6 +321,7 @@ async def process_voice_logic():
                 p = game_state[gamertag]
                 online.append((mem, p['x'], p['y'], p['z']))
             else:
+                # ถ้าไม่อยู่ในเกม ให้กลับ Lobby
                 if mem.voice.channel.id != start.id:
                     if curr - user_last_move.get(mem.id, 0) > MOVE_COOLDOWN:
                         try: 
@@ -359,7 +346,7 @@ async def process_voice_logic():
         
         if not online: continue
 
-        # 2. จัดกลุ่ม
+        # 2. จัดกลุ่ม (Clustering)
         groups = []
         processed = set()
         for i in range(len(online)):
@@ -375,53 +362,75 @@ async def process_voice_logic():
                     processed.add(j)
             groups.append(grp)
             
-        # 3. จัดการห้อง
-        avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
-        taken = set() 
+        # 3. จัดการห้อง (สำคัญ: เรียงกลุ่มใหญ่ -> เล็ก)
+        # เพื่อให้กลุ่มใหญ่สุดมีสิทธิ์เลือกห้องก่อน
         groups.sort(key=len, reverse=True)
         
+        avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
+        taken_rooms = set() 
+        
         for g in groups:
-            if len(g) <= 1:
-                target = start
+            # --- Logic เลือกห้อง ---
+            
+            # นับจำนวนคนในแต่ละห้องที่กลุ่มนี้กระจายตัวอยู่
+            room_counts = {}
+            for m in g:
+                if m.voice and m.voice.channel:
+                    c = m.voice.channel
+                    room_counts[c] = room_counts.get(c, 0) + 1
+            
+            if not room_counts:
+                majority_channel = start
             else:
-                room_counts = {}
-                for m in g:
-                    if m.voice and m.voice.channel:
-                        c = m.voice.channel
-                        room_counts[c] = room_counts.get(c, 0) + 1
-                
-                if not room_counts: majority_channel = start 
-                else: majority_channel = max(room_counts, key=room_counts.get)
-                
-                need_new_room = (majority_channel.id == start.id) or (majority_channel.id in taken)
-                
-                target = None
-                if need_new_room:
+                # 🔥 จุดสำคัญ: เลือกห้องที่มีคนอยู่เยอะที่สุด (Many) เป็นเป้าหมาย
+                # ดังนั้นคนส่วนน้อย (Few) จะถูกย้ายไปหาห้องนี้
+                majority_channel = max(room_counts, key=room_counts.get)
+
+            # เช็คว่าห้องเป้าหมาย ถูกกลุ่มอื่นจองไปแล้วหรือยัง?
+            # ถ้ากลุ่มใหญ่จองไปแล้ว กลุ่มนี้ (ที่เล็กกว่า) ต้องหาห้องใหม่
+            need_new_room = (majority_channel.id == start.id) or (majority_channel.id in taken_rooms)
+            
+            target = None
+            
+            if need_new_room:
+                # หาห้องว่าง (คน 0)
+                for c in avail:
+                    if len(c.members) == 0 and c.id not in taken_rooms:
+                        target = c; break
+                # ถ้าไม่มีห้องว่างจริงๆ เอาห้องที่ไม่ชนกับกลุ่มอื่น
+                if not target:
                     for c in avail:
-                        if len(c.members) == 0 and c.id not in taken:
-                            target = c; break
-                    if not target:
-                        for c in avail:
-                            if c.id not in taken: target = c; break
-                else:
-                    target = majority_channel
-            
+                        if c.id not in taken_rooms: target = c; break
+            else:
+                target = majority_channel
+
             if not target: continue
-            if target.id != start.id: taken.add(target.id)
             
+            # จองห้องนี้ไว้
+            if target.id != start.id:
+                taken_rooms.add(target.id)
+            
+            # เก็บห้องบอทไว้
             for m in g:
                 if m.id == bot.user.id:
                     bot_target_channel = target
-                elif m.voice:
-                    if m.voice.channel.id != target.id:
-                        if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
-                        try:
-                            await m.move_to(target)
-                            user_last_move[m.id] = curr
-                            await asyncio.sleep(0.2)
-                        except discord.HTTPException as e:
-                            if e.status == 429: await asyncio.sleep(2)
 
+            # ย้ายสมาชิกทุกคนในกลุ่มไปที่ Target
+            for m in g:
+                if m.id == bot.user.id: continue
+                if not m.voice: continue
+                
+                # ถ้าย้าย
+                if m.voice.channel.id != target.id:
+                    if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
+                    try:
+                        await m.move_to(target)
+                        user_last_move[m.id] = curr
+                        await asyncio.sleep(0.2)
+                    except discord.HTTPException as e:
+                        if e.status == 429: await asyncio.sleep(2)
+
+        # 4. ย้ายบอททดสอบ
         if bot_target_channel and guild_id in testing_guilds:
             if guild.voice_client:
                 if guild.voice_client.channel.id != bot_target_channel.id:
