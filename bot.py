@@ -11,7 +11,7 @@ import time
 import sys
 from jinja2 import Environment, FileSystemLoader
 
-# --- CONFIGURATION ---
+# --- การตั้งค่าเบื้องต้น ---
 TOKEN = os.getenv("DISCORD_TOKEN")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASS", "admin1234") 
 LOG_WEBHOOK_URL = os.getenv("LOG_WEBHOOK_URL", "") 
@@ -26,7 +26,7 @@ testing_guilds = set()
 DYNAMIC_RANGE = DEFAULT_RANGE
 active_calls = {} 
 
-# --- LOCAL STORAGE SYSTEM ---
+# --- ระบบจัดเก็บข้อมูล ---
 def load_data():
     global server_data
     if os.path.exists(DATA_FILE):
@@ -35,7 +35,6 @@ def load_data():
                 raw_data = json.load(f)
                 temp_data = {int(k): v for k, v in raw_data.items()}
                 
-                # Migration Fix
                 for gid, gdata in temp_data.items():
                     if 'users' in gdata:
                         new_users = {}
@@ -47,9 +46,9 @@ def load_data():
                         gdata['users'] = new_users
                 
                 server_data = temp_data
-            print(f"✅ Loaded Data: {len(server_data)} Servers")
+            print(f"[ระบบ] โหลดข้อมูลสำเร็จ: {len(server_data)} เซิร์ฟเวอร์")
         except Exception as e:
-            print(f"⚠️ Load Error: {e}")
+            print(f"[ข้อผิดพลาด] ไม่สามารถโหลดข้อมูลได้: {e}")
             server_data = {}
 
 def save_data():
@@ -57,7 +56,7 @@ def save_data():
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(server_data, f, ensure_ascii=False, indent=4)
     except Exception as e:
-        print(f"⚠️ Save Error: {e}")
+        print(f"[ข้อผิดพลาด] ไม่สามารถบันทึกข้อมูลได้: {e}")
 
 load_data()
 
@@ -119,19 +118,19 @@ class MyBot(commands.Bot):
         port = int(os.environ.get("PORT", 8080))
         self.web_server = web.TCPSite(runner, '0.0.0.0', port)
         await self.web_server.start()
-        print(f"✅ Web Server running on port {port}")
+        print(f"[ระบบ] เริ่มการทำงานเว็บเซิร์ฟเวอร์บนพอร์ต {port}")
         try: await self.tree.sync()
         except: pass
 
     async def handle_index(self, request):
-        return web.Response(text=f"Bot Online")
+        return web.Response(text=f"บอทกำลังทำงาน (Bot Online)")
 
     async def handle_dashboard(self, request):
         try:
             whitelist_flat = {str(gid): d.get('whitelist') for gid, d in server_data.items() if d.get('whitelist')}
             env = Environment(loader=FileSystemLoader('templates'))
             if not os.path.exists('templates/dashboard.html'):
-                 return web.Response(text="Template not found", status=404)
+                 return web.Response(text="ไม่พบไฟล์หน้าเว็บ (Template not found)", status=404)
             template = env.get_template('dashboard.html')
             rendered = template.render(whitelist=whitelist_flat, password=DASHBOARD_PASSWORD)
             return web.Response(text=rendered, content_type='text/html')
@@ -142,7 +141,7 @@ class MyBot(commands.Bot):
     async def handle_dash_add(self, request): return web.HTTPFound('/dashboard')
     async def handle_dash_remove(self, request): return web.HTTPFound('/dashboard')
 
-    # --- API ---
+    # --- ระบบเชื่อมต่อกับ Addon ---
     async def handle_coords(self, request):
         try:
             data = await request.json()
@@ -187,7 +186,7 @@ class MyBot(commands.Bot):
             return web.json_response({'status': 'ok', 'ic_map': all_ic_map})
             
         except Exception as e:
-            print(f"API Error: {e}")
+            print(f"เกิดข้อผิดพลาดในการรับข้อมูล: {e}")
             return web.json_response({'status': 'error'}, status=500)
 
 bot = MyBot()
@@ -201,9 +200,9 @@ async def on_guild_join(guild):
     else:
         update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
 
-class LinkModal(ui.Modal, title='Voice Chat Registration'):
-    xbox_name = ui.TextInput(label='Xbox Gamertag', placeholder='Your Minecraft Name...', min_length=3, max_length=20)
-    ic_name = ui.TextInput(label='IC Name (Thai)', placeholder='Character Name...', min_length=1, max_length=50)
+class LinkModal(ui.Modal, title='ลงทะเบียนระบบสนทนาด้วยเสียง'):
+    xbox_name = ui.TextInput(label='ชื่อในเกม Xbox (Gamertag)', placeholder='ใส่ชื่อที่ใช้ในเกม Minecraft...', min_length=3, max_length=20)
+    ic_name = ui.TextInput(label='ชื่อตัวละคร (IC Name)', placeholder='ใส่ชื่อตัวละครที่ใช้สวมบทบาท...', min_length=1, max_length=50)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -214,55 +213,53 @@ class LinkModal(ui.Modal, title='Voice Chat Registration'):
         
         data = get_guild_data(interaction.guild_id)
         cfg = data.get('config', {})
-        msg = f"✅ Registered!\n🎮 Xbox: **{gamertag}**\n🎭 IC: **{ic}**"
+        msg = f"บันทึกข้อมูลสำเร็จ!\nชื่อ Xbox: **{gamertag}**\nชื่อตัวละคร: **{ic}**"
         if 'start_channel_id' in cfg:
             chan = interaction.guild.get_channel(cfg['start_channel_id'])
-            if chan: msg += f"\n👉 Please join: {chan.mention}"
+            if chan: msg += f"\n\nกรุณาเข้าไปรอในห้องเสียง: {chan.mention}"
         await interaction.followup.send(msg, ephemeral=True)
 
 class SetupView(ui.View):
     def __init__(self): super().__init__(timeout=None)
-    @ui.button(label="Register / Edit", style=discord.ButtonStyle.green, custom_id="mc_link", emoji="📝")
+    @ui.button(label="ลงทะเบียน / แก้ไขข้อมูล", style=discord.ButtonStyle.green, custom_id="mc_link")
     async def link(self, i: discord.Interaction, b: ui.Button):
         await i.response.send_modal(LinkModal())
 
-    @ui.button(label="Check Status", style=discord.ButtonStyle.primary, custom_id="mc_status", emoji="📊")
+    @ui.button(label="ตรวจสอบสถานะ", style=discord.ButtonStyle.primary, custom_id="mc_status")
     async def status(self, i: discord.Interaction, b: ui.Button):
         data = get_guild_data(i.guild_id)
         users = data.get('users', {})
         if i.user.id not in users:
-            return await i.response.send_message("❌ You are not registered.", ephemeral=True)
+            return await i.response.send_message("คุณยังไม่ได้ลงทะเบียนในระบบ", ephemeral=True)
         
         udata = users[i.user.id]
         gamertag = udata if isinstance(udata, str) else udata['gamertag']
         ic = udata if isinstance(udata, str) else udata['ic_name']
         is_online = gamertag in game_state
         
-        embed = discord.Embed(title="📊 User Info", color=0x3498db)
-        embed.add_field(name="🎮 Gamertag", value=gamertag, inline=True)
-        embed.add_field(name="🎭 IC Name", value=ic, inline=True)
-        # เปลี่ยน Label ให้ชัดเจน
-        embed.add_field(name="In-Game Status", value="🟢 Online" if is_online else "🔴 Offline", inline=False)
+        embed = discord.Embed(title="ข้อมูลผู้ใช้งาน", color=0x3498db)
+        embed.add_field(name="ชื่อ Xbox (Gamertag)", value=gamertag, inline=True)
+        embed.add_field(name="ชื่อตัวละคร (IC)", value=ic, inline=True)
+        embed.add_field(name="สถานะในเกม", value="อยู่ในเกม" if is_online else "ออฟไลน์", inline=False)
         await i.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="setup")
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
     if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
-    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
+    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     
     update_whitelist(interaction.guild_id, interaction.guild.name)
     update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
     
-    # เพิ่มคำอธิบายกลับมาแล้ว
-    embed = discord.Embed(title="🎙️ Voice Chat System", description="1. Click **Register** to link your Xbox Name.\n2. Join **Lobby** voice channel to start.", color=0x2ecc71)
+    embed = discord.Embed(title="ระบบสนทนาด้วยเสียง (Voice Chat)", description="คำแนะนำการใช้งานอย่างละเอียด:\n1. กดปุ่ม 'ลงทะเบียน / แก้ไขข้อมูล' ด้านล่าง\n2. กรอกชื่อ Xbox และชื่อตัวละคร (IC) ของคุณ\n3. เมื่อลงทะเบียนเสร็จสิ้น ให้เข้าไปรอในห้องเสียงล็อบบี้ (Lobby)\n4. ระบบจะทำการย้ายห้องของคุณโดยอัตโนมัติเมื่อพบคุณเข้าเกม", color=0x2ecc71)
     await interaction.channel.send(embed=embed, view=SetupView())
-    await interaction.followup.send("✅ Setup Complete", ephemeral=True)
+    await interaction.followup.send("ตั้งค่าระบบเสร็จสมบูรณ์", ephemeral=True)
 
 @bot.tree.command(name="whitelist")
 async def wl(i: discord.Interaction, server_id: str):
-    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ Admin Only", ephemeral=True)
+    if not i.user.guild_permissions.administrator: return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     update_whitelist(int(server_id), "Added via Cmd")
-    await i.response.send_message(f"✅ Whitelisted {server_id}", ephemeral=True)
+    await i.response.send_message(f"เพิ่มรายชื่อเซิร์ฟเวอร์สำเร็จ: {server_id}", ephemeral=True)
 
 @bot.tree.command(name="range")
 async def set_range(i: discord.Interaction, distance: int):
@@ -270,24 +267,24 @@ async def set_range(i: discord.Interaction, distance: int):
     cfg = data.get('config', {})
     if 'category_id' in cfg:
         update_config(i.guild_id, cfg['category_id'], cfg['start_channel_id'], distance)
-        await i.response.send_message(f"🔊 Range set to {distance}", ephemeral=True)
+        await i.response.send_message(f"ตั้งค่าระยะเสียงเริ่มต้นเป็น {distance} บล็อกเรียบร้อยแล้ว", ephemeral=True)
     else:
-        await i.response.send_message("❌ Please run /setup first", ephemeral=True)
+        await i.response.send_message("โปรดพิมพ์คำสั่ง /setup ก่อนใช้งานคำสั่งนี้", ephemeral=True)
 
 @bot.tree.command(name="test")
 async def test_mode(interaction: discord.Interaction):
     if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
-    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
+    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     gid = interaction.guild_id
     if gid in testing_guilds:
         testing_guilds.remove(gid)
         if interaction.guild.voice_client: await interaction.guild.voice_client.disconnect()
-        await interaction.followup.send("🛑 **Test Mode: OFF**", ephemeral=True)
+        await interaction.followup.send("โหมดทดสอบ: ปิดการใช้งาน", ephemeral=True)
     else:
         testing_guilds.add(gid)
-        await interaction.followup.send("🧪 **Test Mode: ON**", ephemeral=True)
+        await interaction.followup.send("โหมดทดสอบ: เปิดการใช้งาน (บอทจะตามพิกัดของหุ่น botvc ในเกม)", ephemeral=True)
 
-# --- 🟢 CORE LOGIC 🟢 ---
+# --- ระบบจัดการห้องและตำแหน่ง ---
 async def process_voice_logic():
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
@@ -336,29 +333,22 @@ async def process_voice_logic():
                         try: await mem.move_to(start)
                         except: pass
 
-        # --- 🔥 TEST MODE FIX: เพิ่มบอทเข้า Online List ---
-        # ถ้าเปิด Test Mode และมี botvc ใน game_state ให้บอท Discord (guild.me) เข้ามาเล่นด้วย
         if guild_id in testing_guilds:
             found_botvc = False
             botvc_coords = None
             
-            # เช็คว่ามี botvc ใน map ไหม
             for name, p in game_state.items():
                 if name.startswith("botvc"):
                     found_botvc = True
                     botvc_coords = p
                     break
             
-            # ถ้ามี botvc และบอทตัวเอง (guild.me) ว่างอยู่ ให้เพิ่มเข้ากลุ่มคำนวณ
             if found_botvc and botvc_coords:
-                # บังคับบอทให้มีสถานะเป็นผู้เล่นคนหนึ่งที่ตำแหน่ง Armor Stand
                 online.append((guild.me, botvc_coords['x'], botvc_coords['y'], botvc_coords['z']))
             elif not found_botvc:
-                # ถ้า Armor Stand หายไป ให้บอทออกจากห้อง
                 if guild.voice_client: 
                     await guild.voice_client.disconnect()
 
-        # --- 📞 PHONE LOGIC ---
         processed_calls = set()
         taken_rooms = set()
 
@@ -368,22 +358,16 @@ async def process_voice_logic():
             m1 = tag_to_member.get(tag1)
             m2 = tag_to_member.get(tag2)
 
-            # กรณีโทรหาบอท (Test Mode via Phone)
-            # ถ้า tag1 เป็นคน และ tag2 เป็น botvc
             if m1 and (tag2 == "botvc" or tag2.startswith("botvc_")):
                 if guild_id in testing_guilds:
-                    # ให้บอท Discord (guild.me) เป็น m2
                     m2 = guild.me
             
             if m1 and m2:
                 target_room = None
-                # ถ้าอยู่ห้องเดียวกันอยู่แล้ว (และส่วนตัว)
                 if m1.voice and m2.voice and m1.voice.channel.id == m2.voice.channel.id:
                     if len(m1.voice.channel.members) == 2:
                         target_room = m1.voice.channel
-                # กรณีบอท อาจจะยังไม่เข้าห้อง
                 elif m2 == guild.me and m1.voice:
-                    # หาห้องว่างให้คนกับบอท
                     pass 
 
                 if not target_room:
@@ -397,17 +381,14 @@ async def process_voice_logic():
                     processed_calls.add(tag1)
                     processed_calls.add(tag2)
                     
-                    # ย้ายคน
                     if m1.voice and m1.voice.channel.id != target_room.id:
                         try: await m1.move_to(target_room)
                         except: pass
                     
-                    # ย้ายคู่สาย (ถ้าเป็นคน)
                     if m2 != guild.me and m2.voice and m2.voice.channel.id != target_room.id:
                          try: await m2.move_to(target_room)
                          except: pass
                     
-                    # ย้ายบอท (ถ้าคู่สายคือบอท)
                     if m2 == guild.me:
                          if guild.voice_client:
                              if guild.voice_client.channel.id != target_room.id:
@@ -416,7 +397,6 @@ async def process_voice_logic():
                              try: await target_room.connect()
                              except: pass
 
-        # --- 🌐 PROXIMITY LOGIC ---
         if not online: continue
 
         groups = []
@@ -464,7 +444,6 @@ async def process_voice_logic():
             if target.id != start.id: taken_rooms.add(target.id)
             
             for m in g:
-                # ถ้าเป็นบอท (กรณี Proximity)
                 if m == guild.me:
                      if guild.voice_client:
                          if guild.voice_client.channel.id != target.id:
@@ -472,7 +451,6 @@ async def process_voice_logic():
                      else:
                          try: await target.connect()
                          except: pass
-                # ถ้าเป็นคน
                 elif m.voice and m.voice.channel.id != target.id:
                     if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
                     try: 
