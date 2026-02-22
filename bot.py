@@ -284,7 +284,7 @@ async def test_mode(interaction: discord.Interaction):
         testing_guilds.add(gid)
         await interaction.followup.send("โหมดทดสอบ: เปิดการใช้งาน (บอทจะตามพิกัดของหุ่น botvc ในเกม)", ephemeral=True)
 
-# --- ระบบจัดการห้องและตำแหน่ง ---
+# --- ระบบจัดการห้องและตำแหน่ง (Center of Mass Clustering) ---
 async def process_voice_logic():
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
@@ -336,13 +336,11 @@ async def process_voice_logic():
         if guild_id in testing_guilds:
             found_botvc = False
             botvc_coords = None
-            
             for name, p in game_state.items():
                 if name.startswith("botvc"):
                     found_botvc = True
                     botvc_coords = p
                     break
-            
             if found_botvc and botvc_coords:
                 online.append((guild.me, botvc_coords['x'], botvc_coords['y'], botvc_coords['z']))
             elif not found_botvc:
@@ -384,11 +382,9 @@ async def process_voice_logic():
                     if m1.voice and m1.voice.channel.id != target_room.id:
                         try: await m1.move_to(target_room)
                         except: pass
-                    
                     if m2 != guild.me and m2.voice and m2.voice.channel.id != target_room.id:
                          try: await m2.move_to(target_room)
                          except: pass
-                    
                     if m2 == guild.me:
                          if guild.voice_client:
                              if guild.voice_client.channel.id != target_room.id:
@@ -397,24 +393,77 @@ async def process_voice_logic():
                              try: await target_room.connect()
                              except: pass
 
+        # --- 🌐 ระบบศูนย์กลางมวล (Center of Mass Clustering) ---
         if not online: continue
 
-        groups = []
-        processed = set()
-        for i in range(len(online)):
-            if i in processed: continue
-            m1, x1, y1, z1 = online[i]
-            grp = [m1]
-            processed.add(i)
-            for j in range(i+1, len(online)):
-                if j in processed: continue
-                m2, x2, y2, z2 = online[j]
-                if ((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2) <= dist_sq:
-                    grp.append(m2)
-                    processed.add(j)
-            groups.append(grp)
+        # 1. กำหนดให้ทุกคนเป็นศูนย์กลางกลุ่มของตัวเองในตอนแรก
+        clusters = []
+        for m, x, y, z in online:
+            clusters.append({
+                'members': [m],
+                'cx': float(x),
+                'cy': float(y),
+                'cz': float(z),
+                'size': 1
+            })
             
-        groups.sort(key=len, reverse=True)
+        # 2. รวมกลุ่มที่อยู่ใกล้กัน (Hierarchical Merging)
+        while True:
+            best_pair = None
+            min_score = float('inf')
+            
+            for i in range(len(clusters)):
+                for j in range(i + 1, len(clusters)):
+                    c1 = clusters[i]
+                    c2 = clusters[j]
+                    
+                    # หาระยะห่างระหว่าง "จุดศูนย์กลาง" ของทั้งสองกลุ่ม
+                    dist_sq_centers = (c2['cx'] - c1['cx'])**2 + (c2['cy'] - c1['cy'])**2 + (c2['cz'] - c1['cz'])**2
+                    
+                    # ถ้าระยะห่างอยู่ในวงเสียง
+                    if dist_sq_centers <= dist_sq:
+                        # สูตรคำนวณคะแนนการรวมกลุ่ม: 
+                        # - ให้ความสำคัญกับระยะที่ใกล้ที่สุดก่อน
+                        # - หากระยะเท่ากันเป๊ะๆ จะให้กลุ่มที่มีจำนวนคนรวมกันมากกว่า (Few to Many) ชนะ
+                        score = dist_sq_centers - (c1['size'] + c2['size']) * 0.001
+                        
+                        if score < min_score:
+                            min_score = score
+                            best_pair = (i, j)
+            
+            # หากไม่มีกลุ่มไหนที่สามารถรวมกันได้อีกแล้ว ให้ออกจากลูป
+            if best_pair is None:
+                break
+                
+            # ดำเนินการรวมกลุ่มที่เหมาะสมที่สุด
+            i, j = best_pair
+            c1 = clusters[i]
+            c2 = clusters[j]
+            
+            # คำนวณจุดศูนย์กลางใหม่ของกลุ่ม (ถ่วงน้ำหนักตามจำนวนคน)
+            new_size = c1['size'] + c2['size']
+            new_cx = ((c1['cx'] * c1['size']) + (c2['cx'] * c2['size'])) / new_size
+            new_cy = ((c1['cy'] * c1['size']) + (c2['cy'] * c2['size'])) / new_size
+            new_cz = ((c1['cz'] * c1['size']) + (c2['cz'] * c2['size'])) / new_size
+            
+            merged_cluster = {
+                'members': c1['members'] + c2['members'],
+                'cx': new_cx,
+                'cy': new_cy,
+                'cz': new_cz,
+                'size': new_size
+            }
+            
+            # ลบกลุ่มเก่าออก (ต้องลบ Index ที่มากกว่าก่อนเสมอ)
+            clusters.pop(j)
+            clusters.pop(i)
+            # แทนที่ด้วยกลุ่มใหม่
+            clusters.append(merged_cluster)
+
+        # 3. เตรียมข้อมูลกลุ่มที่คำนวณเสร็จแล้วเพื่อย้ายห้อง
+        groups = [c['members'] for c in clusters]
+        groups.sort(key=len, reverse=True) # ให้สิทธิ์กลุ่มใหญ่เลือกห้องก่อน
+        
         avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
         
         for g in groups:
