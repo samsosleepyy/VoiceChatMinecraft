@@ -11,44 +11,33 @@ import time
 import sys
 from jinja2 import Environment, FileSystemLoader
 
-# --- การตั้งค่าเบื้องต้น ---
+# --- CONFIGURATION ---
 TOKEN = os.getenv("DISCORD_TOKEN")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASS", "admin1234") 
 LOG_WEBHOOK_URL = os.getenv("LOG_WEBHOOK_URL", "") 
 DEFAULT_RANGE = 10
+MOVE_COOLDOWN = 5.0
 DATA_FILE = "server_data.json"
-MOVE_COOLDOWN = 3.0
 
+# --- DATA STORES ---
 server_data = {}  
 game_state = {}   
 user_last_move = {}
-testing_guilds = set()
-DYNAMIC_RANGE = DEFAULT_RANGE
-active_calls = {} 
 
-# --- ระบบจัดเก็บข้อมูล ---
+# --- LOCAL STORAGE SYSTEM ---
 def load_data():
     global server_data
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 raw_data = json.load(f)
-                temp_data = {int(k): v for k, v in raw_data.items()}
-                
-                for gid, gdata in temp_data.items():
-                    if 'users' in gdata:
-                        new_users = {}
-                        for uid, udata in gdata['users'].items():
-                            if isinstance(udata, str):
-                                new_users[int(uid)] = {'gamertag': udata, 'ic_name': udata}
-                            elif isinstance(udata, dict):
-                                new_users[int(uid)] = udata
-                        gdata['users'] = new_users
-                
-                server_data = temp_data
-            print(f"[ระบบ] โหลดข้อมูลสำเร็จ: {len(server_data)} เซิร์ฟเวอร์")
+                server_data = {int(k): v for k, v in raw_data.items()}
+                for gid in server_data:
+                    if 'users' in server_data[gid]:
+                        server_data[gid]['users'] = {int(uid): tag for uid, tag in server_data[gid]['users'].items()}
+            print(f"✅ Loaded Data: {len(server_data)} Servers")
         except Exception as e:
-            print(f"[ข้อผิดพลาด] ไม่สามารถโหลดข้อมูลได้: {e}")
+            print(f"⚠️ Load Error: {e}")
             server_data = {}
 
 def save_data():
@@ -56,43 +45,22 @@ def save_data():
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(server_data, f, ensure_ascii=False, indent=4)
     except Exception as e:
-        print(f"[ข้อผิดพลาด] ไม่สามารถบันทึกข้อมูลได้: {e}")
+        print(f"⚠️ Save Error: {e}")
 
 load_data()
 
 def get_guild_data(guild_id):
     if guild_id not in server_data:
-        server_data[guild_id] = {'whitelist': {}, 'config': {}, 'users': {}}
+        server_data[guild_id] = {'whitelist': {}, 'config': {}, 'users': {}, 'zones': {}}
     return server_data[guild_id]
 
-def update_whitelist(guild_id, name, active=True):
-    data = get_guild_data(guild_id)
-    data['whitelist'] = {'active': active, 'name': name}
-    save_data()
-
-def remove_whitelist(guild_id):
-    if guild_id in server_data:
-        if 'whitelist' in server_data[guild_id]:
-            del server_data[guild_id]['whitelist']
-            save_data()
-
-def toggle_whitelist(guild_id):
-    data = get_guild_data(guild_id)
-    if data.get('whitelist'):
-        data['whitelist']['active'] = not data['whitelist'].get('active', False)
-        save_data()
-
-def update_config(guild_id, category_id, start_channel_id, range_val):
-    data = get_guild_data(guild_id)
-    data['config'] = {'category_id': category_id, 'start_channel_id': start_channel_id, 'range': range_val}
-    save_data()
-
-def update_user(guild_id, user_id, gamertag, ic_name):
+def update_user(guild_id, user_id, gamertag):
     data = get_guild_data(guild_id)
     if 'users' not in data: data['users'] = {}
-    data['users'][user_id] = {'gamertag': gamertag, 'ic_name': ic_name}
+    data['users'][user_id] = gamertag
     save_data()
 
+# --- BOT SETUP ---
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
@@ -107,184 +75,132 @@ class MyBot(commands.Bot):
     async def setup_hook(self):
         app = web.Application()
         app.router.add_post('/update_coords', self.handle_coords)
-        app.router.add_get('/', self.handle_index)
-        app.router.add_get('/dashboard', self.handle_dashboard)
-        app.router.add_post('/dashboard/add', self.handle_dash_add)
-        app.router.add_post('/dashboard/remove', self.handle_dash_remove)
-        app.router.add_post('/dashboard/toggle', self.handle_dash_toggle)
+        app.router.add_post('/zone_api', self.handle_zone_api) # API ใหม่สำหรับรับค่าโซน
+        app.router.add_get('/', lambda r: web.Response(text="Bot Online"))
 
         runner = web.AppRunner(app)
         await runner.setup()
         port = int(os.environ.get("PORT", 8080))
         self.web_server = web.TCPSite(runner, '0.0.0.0', port)
         await self.web_server.start()
-        print(f"[ระบบ] เริ่มการทำงานเว็บเซิร์ฟเวอร์บนพอร์ต {port}")
+        print(f"✅ Web Server running on port {port}")
         try: await self.tree.sync()
         except: pass
 
-    async def handle_index(self, request):
-        return web.Response(text=f"บอทกำลังทำงาน (Bot Online)")
-
-    async def handle_dashboard(self, request):
+    # --- 🟢 ZONE API (รับข้อมูลจากกิ่งไม้/ลูกธนู) 🟢 ---
+    async def handle_zone_api(self, request):
         try:
-            whitelist_flat = {str(gid): d.get('whitelist') for gid, d in server_data.items() if d.get('whitelist')}
-            env = Environment(loader=FileSystemLoader('templates'))
-            if not os.path.exists('templates/dashboard.html'):
-                 return web.Response(text="ไม่พบไฟล์หน้าเว็บ (Template not found)", status=404)
-            template = env.get_template('dashboard.html')
-            rendered = template.render(whitelist=whitelist_flat, password=DASHBOARD_PASSWORD)
-            return web.Response(text=rendered, content_type='text/html')
-        except Exception as e: return web.Response(text=str(e), status=500)
+            data = await request.json()
+            admin_tag = data.get('admin')
+            action = data.get('action')
 
-    async def check_pass(self, data): return data.get('password') == DASHBOARD_PASSWORD
-    async def handle_dash_toggle(self, request): return web.HTTPFound('/dashboard')
-    async def handle_dash_add(self, request): return web.HTTPFound('/dashboard')
-    async def handle_dash_remove(self, request): return web.HTTPFound('/dashboard')
+            # หา Guild ID จากชื่อแอดมินที่ตั้งโซน
+            guild_id = None
+            for gid, g_data in server_data.items():
+                if admin_tag in g_data.get('users', {}).values():
+                    guild_id = gid
+                    break
 
-    # --- ระบบเชื่อมต่อกับ Addon ---
+            if not guild_id:
+                return web.json_response({'status': 'error', 'msg': 'Admin not found'})
+
+            g_data = get_guild_data(guild_id)
+            if 'zones' not in g_data: g_data['zones'] = {}
+            zones = g_data['zones']
+
+            if action == 'list':
+                return web.json_response({'status': 'ok', 'zones': list(zones.keys())})
+
+            elif action == 'set':
+                zone_name = data.get('zone')
+                if zone_name in zones:
+                    zones[zone_name]['pos1'] = data.get('pos1')
+                    zones[zone_name]['pos2'] = data.get('pos2')
+                    save_data()
+                    return web.json_response({'status': 'ok'})
+                return web.json_response({'status': 'error'})
+
+            elif action == 'delete':
+                zone_name = data.get('zone')
+                if zone_name in zones:
+                    zones[zone_name]['pos1'] = None
+                    zones[zone_name]['pos2'] = None
+                    save_data()
+                    return web.json_response({'status': 'ok'})
+
+        except Exception as e:
+            return web.json_response({'status': 'error', 'msg': str(e)})
+
+    # --- MAIN COORDS API ---
     async def handle_coords(self, request):
         try:
             data = await request.json()
             global game_state
-            global DYNAMIC_RANGE
-            global active_calls
-
-            user_list = []
-            server_calls = [] 
-
-            if isinstance(data, dict):
-                user_list = data.get('users', [])
-                received_range = data.get('range')
-                if received_range: DYNAMIC_RANGE = int(received_range)
-                server_calls = data.get('calls', []) 
-            elif isinstance(data, list): 
-                user_list = data
-
+            
             current = {}
-            for p in user_list: 
-                current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
+            for p in data: current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
             
-            active_calls.clear()
-            for c in server_calls:
-                p1, p2 = c.get('p1'), c.get('p2')
-                if p1 and p2:
-                    active_calls[p1] = p2
-                    active_calls[p2] = p1
-
-            all_ic_map = {}
-            for gid, gdata in server_data.items():
-                for uid, udata in gdata.get('users', {}).items():
-                    if isinstance(udata, dict):
-                        all_ic_map[udata['gamertag']] = udata['ic_name']
-                    elif isinstance(udata, str): 
-                        all_ic_map[udata] = udata
-
+            verified_names = []
+            for g_data in server_data.values():
+                verified_names.extend(g_data.get('users', {}).values())
+            
             if not self.is_rate_limited:
                 await process_voice_logic()
             
-            return web.json_response({'status': 'ok', 'ic_map': all_ic_map})
-            
+            return web.json_response({'status': 'ok', 'verified': list(set(verified_names))})
         except Exception as e:
-            print(f"เกิดข้อผิดพลาดในการรับข้อมูล: {e}")
             return web.json_response({'status': 'error'}, status=500)
 
 bot = MyBot()
 
-@bot.event
-async def on_guild_join(guild):
-    data = get_guild_data(guild.id)
-    if not data.get('whitelist'):
-        try: await guild.leave()
-        except: pass
-    else:
-        update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
-
-class LinkModal(ui.Modal, title='ลงทะเบียนระบบสนทนาด้วยเสียง'):
-    xbox_name = ui.TextInput(label='ชื่อในเกม Xbox (Gamertag)', placeholder='ใส่ชื่อที่ใช้ในเกม Minecraft...', min_length=3, max_length=20)
-    ic_name = ui.TextInput(label='ชื่อตัวละคร (IC Name)', placeholder='ใส่ชื่อตัวละครที่ใช้สวมบทบาท...', min_length=1, max_length=50)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        gamertag = self.xbox_name.value.strip()
-        ic = self.ic_name.value.strip()
-        
-        update_user(interaction.guild_id, interaction.user.id, gamertag, ic)
-        
-        data = get_guild_data(interaction.guild_id)
-        cfg = data.get('config', {})
-        msg = f"บันทึกข้อมูลสำเร็จ!\nชื่อ Xbox: **{gamertag}**\nชื่อตัวละคร: **{ic}**"
-        if 'start_channel_id' in cfg:
-            chan = interaction.guild.get_channel(cfg['start_channel_id'])
-            if chan: msg += f"\n\nกรุณาเข้าไปรอในห้องเสียง: {chan.mention}"
-        await interaction.followup.send(msg, ephemeral=True)
-
-class SetupView(ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @ui.button(label="ลงทะเบียน / แก้ไขข้อมูล", style=discord.ButtonStyle.green, custom_id="mc_link")
-    async def link(self, i: discord.Interaction, b: ui.Button):
-        await i.response.send_modal(LinkModal())
-
-    @ui.button(label="ตรวจสอบสถานะ", style=discord.ButtonStyle.primary, custom_id="mc_status")
-    async def status(self, i: discord.Interaction, b: ui.Button):
-        data = get_guild_data(i.guild_id)
-        users = data.get('users', {})
-        if i.user.id not in users:
-            return await i.response.send_message("คุณยังไม่ได้ลงทะเบียนในระบบ", ephemeral=True)
-        
-        udata = users[i.user.id]
-        gamertag = udata if isinstance(udata, str) else udata['gamertag']
-        ic = udata if isinstance(udata, str) else udata['ic_name']
-        is_online = gamertag in game_state
-        
-        embed = discord.Embed(title="ข้อมูลผู้ใช้งาน", color=0x3498db)
-        embed.add_field(name="ชื่อ Xbox (Gamertag)", value=gamertag, inline=True)
-        embed.add_field(name="ชื่อตัวละคร (IC)", value=ic, inline=True)
-        embed.add_field(name="สถานะในเกม", value="อยู่ในเกม" if is_online else "ออฟไลน์", inline=False)
-        await i.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="setup")
-async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
-    if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
-    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
+# --- COMMANDS ---
+@bot.tree.command(name="setup", description="ตั้งค่าเริ่มต้น")
+async def setup(i: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel):
+    if not i.response.is_done(): await i.response.defer(ephemeral=True)
+    if not i.user.guild_permissions.administrator: return await i.followup.send("❌ Admin Only", ephemeral=True)
     
-    update_whitelist(interaction.guild_id, interaction.guild.name)
-    update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
-    
-    embed = discord.Embed(title="ระบบสนทนาด้วยเสียง (Voice Chat)", description="คำแนะนำการใช้งานอย่างละเอียด:\n1. กดปุ่ม 'ลงทะเบียน / แก้ไขข้อมูล' ด้านล่าง\n2. กรอกชื่อ Xbox และชื่อตัวละคร (IC) ของคุณ\n3. เมื่อลงทะเบียนเสร็จสิ้น ให้เข้าไปรอในห้องเสียงล็อบบี้ (Lobby)\n4. ระบบจะทำการย้ายห้องของคุณโดยอัตโนมัติเมื่อพบคุณเข้าเกม", color=0x2ecc71)
-    await interaction.channel.send(embed=embed, view=SetupView())
-    await interaction.followup.send("ตั้งค่าระบบเสร็จสมบูรณ์", ephemeral=True)
-
-@bot.tree.command(name="whitelist")
-async def wl(i: discord.Interaction, server_id: str):
-    if not i.user.guild_permissions.administrator: return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
-    update_whitelist(int(server_id), "Added via Cmd")
-    await i.response.send_message(f"เพิ่มรายชื่อเซิร์ฟเวอร์สำเร็จ: {server_id}", ephemeral=True)
-
-@bot.tree.command(name="range")
-async def set_range(i: discord.Interaction, distance: int):
     data = get_guild_data(i.guild_id)
-    cfg = data.get('config', {})
-    if 'category_id' in cfg:
-        update_config(i.guild_id, cfg['category_id'], cfg['start_channel_id'], distance)
-        await i.response.send_message(f"ตั้งค่าระยะเสียงเริ่มต้นเป็น {distance} บล็อกเรียบร้อยแล้ว", ephemeral=True)
-    else:
-        await i.response.send_message("โปรดพิมพ์คำสั่ง /setup ก่อนใช้งานคำสั่งนี้", ephemeral=True)
+    data['whitelist'] = {'active': True, 'name': i.guild.name}
+    data['config'] = {'category_id': category.id, 'start_channel_id': start_channel.id, 'range': DEFAULT_RANGE}
+    save_data()
+    await i.followup.send("✅ Setup Complete!", ephemeral=True)
 
-@bot.tree.command(name="test")
-async def test_mode(interaction: discord.Interaction):
-    if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
-    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
-    gid = interaction.guild_id
-    if gid in testing_guilds:
-        testing_guilds.remove(gid)
-        if interaction.guild.voice_client: await interaction.guild.voice_client.disconnect()
-        await interaction.followup.send("โหมดทดสอบ: ปิดการใช้งาน", ephemeral=True)
-    else:
-        testing_guilds.add(gid)
-        await interaction.followup.send("โหมดทดสอบ: เปิดการใช้งาน (บอทจะตามพิกัดของหุ่น botvc ในเกม)", ephemeral=True)
+@bot.tree.command(name="zone", description="สร้างห้องแยกพื้นที่ (โซน)")
+async def make_zone(i: discord.Interaction, name: str, category: discord.CategoryChannel):
+    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ Admin Only", ephemeral=True)
+    
+    data = get_guild_data(i.guild_id)
+    if 'zones' not in data: data['zones'] = {}
+    
+    data['zones'][name] = {
+        'category_id': category.id,
+        'pos1': None,
+        'pos2': None
+    }
+    save_data()
+    await i.response.send_message(f"✅ สร้างโซน **{name}** ในหมวดหมู่ **{category.name}** แล้ว\n👉 เข้าเกมแล้วพิมพ์ `/scriptevent vc:tool` เพื่อตีกรอบพื้นที่ได้เลย!", ephemeral=True)
 
-# --- ระบบจัดการห้องและตำแหน่ง (Center of Mass Clustering) ---
+class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
+    xbox_name = ui.TextInput(label='Xbox Gamertag')
+    async def on_submit(self, i: discord.Interaction):
+        if not i.response.is_done(): await i.response.defer(ephemeral=True)
+        gamertag = self.xbox_name.value.strip()
+        update_user(i.guild_id, i.user.id, gamertag)
+        await i.followup.send(f"✅ Saved **{gamertag}**", ephemeral=True)
+
+@bot.tree.command(name="link", description="เชื่อมต่อชื่อ")
+async def link_cmd(i: discord.Interaction):
+    await i.response.send_modal(LinkModal())
+
+# --- 🟢 CORE LOGIC: ZONE OCCLUSION 🟢 ---
+def is_in_zone(x, y, z, pos1, pos2):
+    if not pos1 or not pos2: return False
+    min_x, max_x = min(pos1['x'], pos2['x']), max(pos1['x'], pos2['x'])
+    min_y, max_y = min(pos1['y'], pos2['y']), max(pos1['y'], pos2['y'])
+    min_z, max_z = min(pos1['z'], pos2['z']), max(pos1['z'], pos2['z'])
+    return (min_x <= x <= max_x) and (min_y <= y <= max_y) and (min_z <= z <= max_z)
+
 async def process_voice_logic():
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
@@ -297,216 +213,110 @@ async def process_voice_logic():
         guild = bot.get_guild(guild_id)
         if not guild: continue
         
-        cat = guild.get_channel(cfg.get('category_id'))
+        main_cat = guild.get_channel(cfg.get('category_id'))
         start = guild.get_channel(cfg.get('start_channel_id'))
-        if not cat or not start: continue
+        if not main_cat or not start: continue
         
-        config_range = cfg.get('range', DEFAULT_RANGE)
-        active_range = DYNAMIC_RANGE if DYNAMIC_RANGE > 0 else config_range
-        dist_sq = active_range ** 2
+        dist_sq = cfg.get('range', DEFAULT_RANGE) ** 2
+        y_penalty = 3.0 # ถ่วงน้ำหนักแกน Y ลดเสียงทะลุชั้น
+        
+        # เตรียมถังแยกประเภทคน (Buckets) ตามโซน
+        zones = data.get('zones', {})
+        buckets = {'__global__': {'category_id': main_cat.id, 'players': []}}
+        for zname, zdata in zones.items():
+            if zdata.get('category_id'):
+                buckets[zname] = {'category_id': zdata['category_id'], 'players': []}
         
         users_map = data.get('users', {})
-        
-        online = []
-        in_call_users = set()
-        tag_to_member = {}
-
-        for uid, udata in users_map.items():
-            gamertag = udata if isinstance(udata, str) else udata['gamertag']
-            
+        for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
-            if not mem or not mem.voice: continue
-            if mem.voice.channel.category_id != cat.id: continue
-            
-            tag_to_member[gamertag] = mem
-
-            if gamertag in active_calls:
-                in_call_users.add(uid)
-                continue 
+            if not mem or not mem.voice or not mem.voice.channel: continue
             
             if gamertag in game_state:
                 p = game_state[gamertag]
-                online.append((mem, p['x'], p['y'], p['z']))
+                px, py, pz = p['x'], p['y'], p['z']
+                
+                # หาว่าผู้เล่นยืนอยู่ในโซนไหน
+                current_zone = '__global__'
+                for zname, zdata in zones.items():
+                    if is_in_zone(px, py, pz, zdata.get('pos1'), zdata.get('pos2')):
+                        current_zone = zname
+                        break # เจอโซนแรกให้หยุด
+                
+                buckets[current_zone]['players'].append((mem, px, py, pz))
             else:
+                # Disconnect -> กลับห้อง Start
                 if mem.voice.channel.id != start.id:
                     if curr - user_last_move.get(mem.id, 0) > MOVE_COOLDOWN:
-                        try: await mem.move_to(start)
+                        try: 
+                            await mem.move_to(start)
+                            user_last_move[mem.id] = curr
+                            await asyncio.sleep(0.2)
                         except: pass
-
-        if guild_id in testing_guilds:
-            found_botvc = False
-            botvc_coords = None
-            for name, p in game_state.items():
-                if name.startswith("botvc"):
-                    found_botvc = True
-                    botvc_coords = p
-                    break
-            if found_botvc and botvc_coords:
-                online.append((guild.me, botvc_coords['x'], botvc_coords['y'], botvc_coords['z']))
-            elif not found_botvc:
-                if guild.voice_client: 
-                    await guild.voice_client.disconnect()
-
-        processed_calls = set()
-        taken_rooms = set()
-
-        for tag1, tag2 in active_calls.items():
-            if tag1 in processed_calls: continue
-            
-            m1 = tag_to_member.get(tag1)
-            m2 = tag_to_member.get(tag2)
-
-            if m1 and (tag2 == "botvc" or tag2.startswith("botvc_")):
-                if guild_id in testing_guilds:
-                    m2 = guild.me
-            
-            if m1 and m2:
-                target_room = None
-                if m1.voice and m2.voice and m1.voice.channel.id == m2.voice.channel.id:
-                    if len(m1.voice.channel.members) == 2:
-                        target_room = m1.voice.channel
-                elif m2 == guild.me and m1.voice:
-                    pass 
-
-                if not target_room:
-                    avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
-                    for c in avail:
-                        if len(c.members) == 0 and c.id not in taken_rooms:
-                            target_room = c; break
-                
-                if target_room:
-                    taken_rooms.add(target_room.id)
-                    processed_calls.add(tag1)
-                    processed_calls.add(tag2)
-                    
-                    if m1.voice and m1.voice.channel.id != target_room.id:
-                        try: await m1.move_to(target_room)
-                        except: pass
-                    if m2 != guild.me and m2.voice and m2.voice.channel.id != target_room.id:
-                         try: await m2.move_to(target_room)
-                         except: pass
-                    if m2 == guild.me:
-                         if guild.voice_client:
-                             if guild.voice_client.channel.id != target_room.id:
-                                 await guild.voice_client.move_to(target_room)
-                         else:
-                             try: await target_room.connect()
-                             except: pass
-
-        # --- 🌐 ระบบศูนย์กลางมวล (Center of Mass Clustering) ---
-        if not online: continue
-
-        # 1. กำหนดให้ทุกคนเป็นศูนย์กลางกลุ่มของตัวเองในตอนแรก
-        clusters = []
-        for m, x, y, z in online:
-            clusters.append({
-                'members': [m],
-                'cx': float(x),
-                'cy': float(y),
-                'cz': float(z),
-                'size': 1
-            })
-            
-        # 2. รวมกลุ่มที่อยู่ใกล้กัน (Hierarchical Merging)
-        while True:
-            best_pair = None
-            min_score = float('inf')
-            
-            for i in range(len(clusters)):
-                for j in range(i + 1, len(clusters)):
-                    c1 = clusters[i]
-                    c2 = clusters[j]
-                    
-                    # หาระยะห่างระหว่าง "จุดศูนย์กลาง" ของทั้งสองกลุ่ม
-                    dist_sq_centers = (c2['cx'] - c1['cx'])**2 + (c2['cy'] - c1['cy'])**2 + (c2['cz'] - c1['cz'])**2
-                    
-                    # ถ้าระยะห่างอยู่ในวงเสียง
-                    if dist_sq_centers <= dist_sq:
-                        # สูตรคำนวณคะแนนการรวมกลุ่ม: 
-                        # - ให้ความสำคัญกับระยะที่ใกล้ที่สุดก่อน
-                        # - หากระยะเท่ากันเป๊ะๆ จะให้กลุ่มที่มีจำนวนคนรวมกันมากกว่า (Few to Many) ชนะ
-                        score = dist_sq_centers - (c1['size'] + c2['size']) * 0.001
-                        
-                        if score < min_score:
-                            min_score = score
-                            best_pair = (i, j)
-            
-            # หากไม่มีกลุ่มไหนที่สามารถรวมกันได้อีกแล้ว ให้ออกจากลูป
-            if best_pair is None:
-                break
-                
-            # ดำเนินการรวมกลุ่มที่เหมาะสมที่สุด
-            i, j = best_pair
-            c1 = clusters[i]
-            c2 = clusters[j]
-            
-            # คำนวณจุดศูนย์กลางใหม่ของกลุ่ม (ถ่วงน้ำหนักตามจำนวนคน)
-            new_size = c1['size'] + c2['size']
-            new_cx = ((c1['cx'] * c1['size']) + (c2['cx'] * c2['size'])) / new_size
-            new_cy = ((c1['cy'] * c1['size']) + (c2['cy'] * c2['size'])) / new_size
-            new_cz = ((c1['cz'] * c1['size']) + (c2['cz'] * c2['size'])) / new_size
-            
-            merged_cluster = {
-                'members': c1['members'] + c2['members'],
-                'cx': new_cx,
-                'cy': new_cy,
-                'cz': new_cz,
-                'size': new_size
-            }
-            
-            # ลบกลุ่มเก่าออก (ต้องลบ Index ที่มากกว่าก่อนเสมอ)
-            clusters.pop(j)
-            clusters.pop(i)
-            # แทนที่ด้วยกลุ่มใหม่
-            clusters.append(merged_cluster)
-
-        # 3. เตรียมข้อมูลกลุ่มที่คำนวณเสร็จแล้วเพื่อย้ายห้อง
-        groups = [c['members'] for c in clusters]
-        groups.sort(key=len, reverse=True) # ให้สิทธิ์กลุ่มใหญ่เลือกห้องก่อน
         
-        avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
-        
-        for g in groups:
-            room_counts = {}
-            for m in g:
-                if m.voice and m.voice.channel:
-                    c = m.voice.channel
-                    room_counts[c] = room_counts.get(c, 0) + 1
+        # --- ประมวลผลแยกทีละหมวดหมู่ (Zone Isolation) ---
+        taken = set()
+        for b_name, bucket in buckets.items():
+            if not bucket['players']: continue
             
-            if not room_counts: majority_channel = start 
-            else: majority_channel = max(room_counts, key=room_counts.get)
-
-            need_new_room = (majority_channel.id == start.id) or (majority_channel.id in taken_rooms)
-            target = None
+            target_cat = guild.get_channel(bucket['category_id'])
+            if not target_cat: continue
             
-            if need_new_room:
-                for c in avail:
-                    if len(c.members) == 0 and c.id not in taken_rooms:
-                        target = c; break
+            avail = [c for c in target_cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
+            online = bucket['players']
+            
+            # จัดกลุ่มคนที่อยู่ใกล้กัน (เฉพาะในโซนเดียวกัน)
+            groups = []
+            processed = set()
+            for i in range(len(online)):
+                if i in processed: continue
+                m1, x1, y1, z1 = online[i]
+                grp = [m1]
+                processed.add(i)
+                for j in range(i+1, len(online)):
+                    if j in processed: continue
+                    m2, x2, y2, z2 = online[j]
+                    
+                    # คำนวณระยะโดยรวม Y-Penalty
+                    d_sq = (x2-x1)**2 + ((y2-y1)*y_penalty)**2 + (z2-z1)**2
+                    if d_sq <= dist_sq:
+                        grp.append(m2)
+                        processed.add(j)
+                groups.append(grp)
+            
+            # โหวตเลือกห้องของกลุ่มนี้
+            for g in groups:
+                target = None
+                room_counts = {}
+                for m in g:
+                    room_counts[m.voice.channel] = room_counts.get(m.voice.channel, 0) + 1
+                
+                maj_chan = max(room_counts, key=room_counts.get)
+                
+                # ถ้าห้องส่วนใหญ่อยู่ผิดหมวดหมู่ หรืออยู่ Lobby -> ต้องหาห้องใหม่ในหมวดหมู่ของโซนนี้
+                if maj_chan.category_id != target_cat.id or maj_chan.id == start.id:
+                    target = next((c for c in avail if len(c.members) == 0 and c.id not in taken), None)
+                else:
+                    target = maj_chan
+                
+                # Fallback: ถ้าเต็มหมด ยัดเข้าห้องไหนก็ได้ในโซนนั้น
                 if not target:
-                    for c in avail:
-                        if c.id not in taken_rooms: target = c; break
-            else:
-                target = majority_channel
-
-            if not target: continue
-            if target.id != start.id: taken_rooms.add(target.id)
-            
-            for m in g:
-                if m == guild.me:
-                     if guild.voice_client:
-                         if guild.voice_client.channel.id != target.id:
-                             await guild.voice_client.move_to(target)
-                     else:
-                         try: await target.connect()
-                         except: pass
-                elif m.voice and m.voice.channel.id != target.id:
-                    if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
-                    try: 
-                        await m.move_to(target)
-                        user_last_move[m.id] = curr
-                        await asyncio.sleep(0.2)
-                    except: pass
+                    target = next((c for c in avail if c.id not in taken), None)
+                    if not target and avail: target = avail[0] 
+                
+                if not target: continue
+                taken.add(target.id)
+                
+                # สั่งย้าย
+                for m in g:
+                    if m.voice.channel.id != target.id:
+                        if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
+                        try:
+                            await m.move_to(target)
+                            user_last_move[m.id] = curr
+                            await asyncio.sleep(0.2)
+                        except discord.HTTPException as e:
+                            if e.status == 429: await asyncio.sleep(2)
 
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
@@ -515,9 +325,5 @@ if __name__ == "__main__":
         try:
             bot.is_rate_limited = False
             bot.run(TOKEN)
-        except discord.errors.HTTPException as e:
-            if e.status == 429:
-                bot.is_rate_limited = True
-                time.sleep(60)
-            else: time.sleep(10)
-        except: time.sleep(30)
+        except Exception as e:
+            time.sleep(10)
