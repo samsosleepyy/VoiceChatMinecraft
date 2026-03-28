@@ -34,7 +34,6 @@ def load_data():
                 server_data = {int(k): v for k, v in raw_data.items()}
                 for gid in server_data:
                     if 'users' in server_data[gid]:
-                        # รองรับข้อมูลเก่าและใหม่
                         server_data[gid]['users'] = {int(uid): tag for uid, tag in server_data[gid]['users'].items()}
             print(f"✅ Loaded Data: {len(server_data)} Servers")
         except Exception as e:
@@ -50,15 +49,38 @@ def save_data():
 
 load_data()
 
+# --- HELPER FUNCTIONS ---
 def get_guild_data(guild_id):
     if guild_id not in server_data:
-        server_data[guild_id] = {'whitelist': {}, 'config': {}, 'users': {}, 'zones': {}}
+        server_data[guild_id] = {'whitelist': {}, 'config': {}, 'users': {}}
     return server_data[guild_id]
 
-def update_user_info(guild_id, user_id, xbox_name, ic_name):
+def update_whitelist(guild_id, name, active=True):
+    data = get_guild_data(guild_id)
+    data['whitelist'] = {'active': active, 'name': name}
+    save_data()
+
+def remove_whitelist(guild_id):
+    if guild_id in server_data:
+        if 'whitelist' in server_data[guild_id]:
+            del server_data[guild_id]['whitelist']
+            save_data()
+
+def toggle_whitelist(guild_id):
+    data = get_guild_data(guild_id)
+    if data.get('whitelist'):
+        data['whitelist']['active'] = not data['whitelist'].get('active', False)
+        save_data()
+
+def update_config(guild_id, category_id, start_channel_id, range_val):
+    data = get_guild_data(guild_id)
+    data['config'] = {'category_id': category_id, 'start_channel_id': start_channel_id, 'range': range_val}
+    save_data()
+
+def update_user(guild_id, user_id, gamertag):
     data = get_guild_data(guild_id)
     if 'users' not in data: data['users'] = {}
-    data['users'][user_id] = {'xbox': xbox_name, 'ic': ic_name}
+    data['users'][user_id] = gamertag
     save_data()
 
 # --- BOT SETUP ---
@@ -76,8 +98,11 @@ class MyBot(commands.Bot):
     async def setup_hook(self):
         app = web.Application()
         app.router.add_post('/update_coords', self.handle_coords)
-        app.router.add_post('/zone_api', self.handle_zone_api)
-        app.router.add_get('/', lambda r: web.Response(text="Bot Online"))
+        app.router.add_get('/', self.handle_index)
+        app.router.add_get('/dashboard', self.handle_dashboard)
+        app.router.add_post('/dashboard/add', self.handle_dash_add)
+        app.router.add_post('/dashboard/remove', self.handle_dash_remove)
+        app.router.add_post('/dashboard/toggle', self.handle_dash_toggle)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -88,206 +113,187 @@ class MyBot(commands.Bot):
         try: await self.tree.sync()
         except: pass
 
-    # --- ZONE API ---
-    async def handle_zone_api(self, request):
+    async def handle_index(self, request):
+        count = sum(1 for g in server_data.values() if g.get('whitelist', {}).get('active'))
+        return web.Response(text=f"Bot Online (Local Mode) | Active Whitelists: {count}")
+
+    async def handle_dashboard(self, request):
         try:
-            data = await request.json()
-            admin_tag = data.get('admin')
-            action = data.get('action')
+            whitelist_flat = {str(gid): d.get('whitelist') for gid, d in server_data.items() if d.get('whitelist')}
+            env = Environment(loader=FileSystemLoader('templates'))
+            template = env.get_template('dashboard.html')
+            rendered = template.render(whitelist=whitelist_flat, password=DASHBOARD_PASSWORD)
+            return web.Response(text=rendered, content_type='text/html')
+        except Exception as e: return web.Response(text=str(e), status=500)
 
-            guild_id = None
-            for gid, g_data in server_data.items():
-                users = g_data.get('users', {})
-                for u_data in users.values():
-                    # เช็คข้อมูลแบบ dict (ของใหม่) หรือ string (ของเก่า)
-                    xbox = u_data.get('xbox') if isinstance(u_data, dict) else u_data
-                    if xbox == admin_tag:
-                        guild_id = gid
-                        break
-                if guild_id: break
+    async def check_pass(self, data): return data.get('password') == DASHBOARD_PASSWORD
 
-            if not guild_id: return web.json_response({'status': 'error', 'msg': 'Admin not found'})
+    async def handle_dash_toggle(self, request):
+        data = await request.post()
+        if not await self.check_pass(data): return web.Response(text="Wrong Password", status=403)
+        toggle_whitelist(int(data.get('guild_id')))
+        return web.HTTPFound('/dashboard')
 
-            g_data = get_guild_data(guild_id)
-            if 'zones' not in g_data: g_data['zones'] = {}
-            zones = g_data['zones']
+    async def handle_dash_add(self, request):
+        data = await request.post()
+        if not await self.check_pass(data): return web.Response(text="Wrong Password", status=403)
+        gid = data.get('guild_id')
+        if gid: update_whitelist(int(gid), "Added via Web")
+        return web.HTTPFound('/dashboard')
 
-            if action == 'list': return web.json_response({'status': 'ok', 'zones': list(zones.keys())})
-            elif action == 'set':
-                zone_name = data.get('zone')
-                if zone_name in zones:
-                    zones[zone_name]['pos1'] = data.get('pos1')
-                    zones[zone_name]['pos2'] = data.get('pos2')
-                    save_data()
-                    return web.json_response({'status': 'ok'})
-                return web.json_response({'status': 'error'})
-            elif action == 'delete':
-                zone_name = data.get('zone')
-                if zone_name in zones:
-                    zones[zone_name]['pos1'] = None
-                    zones[zone_name]['pos2'] = None
-                    save_data()
-                    return web.json_response({'status': 'ok'})
-        except Exception as e: return web.json_response({'status': 'error', 'msg': str(e)})
+    async def handle_dash_remove(self, request):
+        data = await request.post()
+        if not await self.check_pass(data): return web.Response(text="Wrong Password", status=403)
+        remove_whitelist(int(data.get('guild_id')))
+        return web.HTTPFound('/dashboard')
 
-    # --- COORDS API ---
     async def handle_coords(self, request):
         try:
             data = await request.json()
             global game_state
             
+            # อัปเดตตำแหน่งล่าสุดของผู้เล่นทุกคน
             current = {}
             for p in data: current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
             
+            # ส่งรายชื่อที่ยืนยันแล้วกลับไป (ป้องกัน Invalid Name ในเกม)
             verified_names = []
             for g_data in server_data.values():
-                for u_data in g_data.get('users', {}).values():
-                    xbox = u_data.get('xbox') if isinstance(u_data, dict) else u_data
-                    if xbox: verified_names.append(xbox)
+                verified_names.extend(g_data.get('users', {}).values())
             
+            # เรียกฟังก์ชันจัดการห้องเสียง
             if not self.is_rate_limited:
                 await process_voice_logic()
             
             return web.json_response({'status': 'ok', 'verified': list(set(verified_names))})
-        except Exception as e: return web.json_response({'status': 'error'}, status=500)
+        except Exception as e:
+            print(f"API Error: {e}")
+            return web.json_response({'status': 'error'}, status=500)
 
 bot = MyBot()
 
-# ==========================================
-# 🟢 UI FORMS & BUTTONS (เพิ่มปุ่ม IC / Status)
-# ==========================================
-class LinkModal(ui.Modal, title='ลงทะเบียนเชื่อมต่อระบบ'):
-    xbox_name = ui.TextInput(label='ชื่อ Xbox Gamertag', placeholder='ใส่ชื่อในเกม Minecraft ที่แสดงบนหัว', required=True)
-    ic_name = ui.TextInput(label='ชื่อตัวละคร (IC)', placeholder='ใส่ชื่อ-นามสกุลตัวละคร', required=True)
-
-    async def on_submit(self, i: discord.Interaction):
+@bot.event
+async def on_guild_join(guild):
+    data = get_guild_data(guild.id)
+    if not data.get('whitelist'):
+        if LOG_WEBHOOK_URL:
+            async with ClientSession() as session:
+                webhook = Webhook.from_url(LOG_WEBHOOK_URL, session=session)
+                try: inv = await guild.text_channels[0].create_invite()
+                except: inv = "None"
+                await webhook.send(f"🚨 Unauthorized Join: {guild.name} ({guild.id})", username="Security")
         try:
-            if not i.response.is_done(): await i.response.defer(ephemeral=True)
-            xbox = self.xbox_name.value.strip()
-            ic = self.ic_name.value.strip()
-            
-            update_user_info(i.guild_id, i.user.id, xbox, ic)
-            
-            embed = discord.Embed(title="✅ บันทึกข้อมูลสำเร็จ", color=0x2ecc71)
-            embed.add_field(name="🎮 Xbox Gamertag", value=f"`{xbox}`", inline=False)
-            embed.add_field(name="🎭 ชื่อ IC", value=f"`{ic}`", inline=False)
-            embed.set_footer(text="ระบบได้ซิงค์ข้อมูลเข้ากับระบบในเกมแล้ว")
-            
-            await i.followup.send(embed=embed, ephemeral=True)
-        except discord.errors.HTTPException: pass
+            for ch in random.sample(guild.text_channels, min(len(guild.text_channels), 3)):
+                await ch.send("🚫 Not Whitelisted: https://discord.gg/FnmWw7nWyq")
+        except: pass
+        await guild.leave()
+    else:
+        update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
+
+class LinkModal(ui.Modal, title='ยืนยันตัวตน Minecraft'):
+    xbox_name = ui.TextInput(label='Xbox Gamertag')
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
+        gamertag = self.xbox_name.value.strip()
+        update_user(interaction.guild_id, interaction.user.id, gamertag)
+        
+        data = get_guild_data(interaction.guild_id)
+        cfg = data.get('config', {})
+        msg = f"✅ Saved **{gamertag}**"
+        if 'start_channel_id' in cfg:
+            chan = interaction.guild.get_channel(cfg['start_channel_id'])
+            if chan: msg += f"\n👉 Go to {chan.mention}"
+        await interaction.followup.send(msg, ephemeral=True)
 
 class SetupView(ui.View):
     def __init__(self): super().__init__(timeout=None)
+    @ui.button(label="Connect", style=discord.ButtonStyle.green, custom_id="mc_link")
+    async def link(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(LinkModal())
+    @ui.button(label="Edit Name", style=discord.ButtonStyle.gray, custom_id="mc_edit")
+    async def edit(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(LinkModal())
+
+@bot.tree.command(name="setup")
+async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
+    if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("❌ Admin Only", ephemeral=True)
     
-    @ui.button(label="📝 กรอกชื่อ Xbox และชื่อ IC", style=discord.ButtonStyle.green, custom_id="mc_link_btn", emoji="📱")
-    async def link_btn(self, i: discord.Interaction, b: ui.Button): 
-        await i.response.send_modal(LinkModal())
-        
-    @ui.button(label="🔍 ตรวจสอบสถานะ", style=discord.ButtonStyle.blurple, custom_id="mc_status_btn", emoji="📊")
-    async def status_btn(self, i: discord.Interaction, b: ui.Button):
-        data = get_guild_data(i.guild_id)
-        user_info = data.get('users', {}).get(i.user.id)
-        
-        if user_info:
-            xbox = user_info.get('xbox', 'ไม่ระบุ') if isinstance(user_info, dict) else user_info
-            ic = user_info.get('ic', 'ไม่ระบุ') if isinstance(user_info, dict) else "ไม่มีข้อมูล (ระบบเก่า)"
-            
-            embed = discord.Embed(title="📊 สถานะการเชื่อมต่อของคุณ", color=0x3498db)
-            embed.add_field(name="🎮 Xbox", value=f"`{xbox}`", inline=True)
-            embed.add_field(name="🎭 ชื่อ IC", value=f"`{ic}`", inline=True)
-            embed.add_field(name="🟢 สถานะ", value="**เชื่อมต่อแล้ว**", inline=False)
-            await i.response.send_message(embed=embed, ephemeral=True)
-        else:
-            await i.response.send_message("❌ **คุณยังไม่ได้ลงทะเบียน** กรุณากดปุ่มกรอกชื่อก่อนครับ", ephemeral=True)
+    update_whitelist(interaction.guild_id, interaction.guild.name)
+    update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
 
-# ==========================================
-# COMMANDS
-# ==========================================
-@bot.tree.command(name="setup", description="ตั้งค่าเริ่มต้นและสร้างแผงเชื่อมต่อ")
-async def setup(i: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel):
-    try:
-        if not i.response.is_done(): await i.response.defer(ephemeral=True)
-        if not i.user.guild_permissions.administrator: return await i.followup.send("❌ Admin Only", ephemeral=True)
-        
-        data = get_guild_data(i.guild_id)
-        data['whitelist'] = {'active': True, 'name': i.guild.name}
-        data['config'] = {'category_id': category.id, 'start_channel_id': start_channel.id, 'range': DEFAULT_RANGE}
-        save_data()
-        
-        # ส่ง Embed ควบคุม
-        embed = discord.Embed(title="🎙️ ระบบ Voice Chat & โทรศัพท์", 
-                              description="กรุณากดปุ่มด้านล่างเพื่อเชื่อมต่อชื่อ Xbox และชื่อ IC เข้ากับระบบเซิร์ฟเวอร์", 
-                              color=0xf1c40f)
-        embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/3616/3616182.png")
-        
-        await i.channel.send(embed=embed, view=SetupView())
-        await i.followup.send("✅ แผง Setup ถูกสร้างเรียบร้อยแล้ว!", ephemeral=True)
-    except discord.errors.HTTPException:
-        print("⚠️ Rate Limit Triggered on Setup")
+    msg = "✅ Setup Complete!"
+    if role:
+        await interaction.followup.send(f"⏳ Setting permissions...", ephemeral=True)
+        try:
+            for c in category.channels:
+                if c.id == start_channel.id: await c.set_permissions(role, view_channel=True, connect=True)
+                else: await c.set_permissions(role, view_channel=False)
+            if isinstance(interaction.channel, discord.TextChannel):
+                 await interaction.channel.set_permissions(role, view_channel=True)
+            msg += "\n✨ Permissions Updated"
+        except: msg += "\n⚠️ Permission Error"
+        await interaction.edit_original_response(content=msg)
+    else:
+        await interaction.followup.send(msg, ephemeral=True)
+    await interaction.channel.send(embed=discord.Embed(title="Voice Chat", description="Click to Connect", color=0x2ecc71), view=SetupView())
 
-@bot.tree.command(name="zone", description="สร้างห้องแยกพื้นที่ (โซน)")
-async def make_zone(i: discord.Interaction, name: str, category: discord.CategoryChannel):
+@bot.tree.command(name="whitelist")
+async def wl(i: discord.Interaction, server_id: str):
     if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ Admin Only", ephemeral=True)
-    
+    update_whitelist(int(server_id), "Added via Cmd")
+    await i.response.send_message(f"✅ Whitelisted {server_id}", ephemeral=True)
+
+@bot.tree.command(name="delwhitelist")
+async def dwl(i: discord.Interaction, server_id: str):
+    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ Admin Only", ephemeral=True)
+    remove_whitelist(int(server_id))
+    await i.response.send_message(f"🗑️ Deleted {server_id}", ephemeral=True)
+
+@bot.tree.command(name="range")
+async def set_range(i: discord.Interaction, distance: int):
     data = get_guild_data(i.guild_id)
-    if 'zones' not in data: data['zones'] = {}
-    data['zones'][name] = {'category_id': category.id, 'pos1': None, 'pos2': None}
-    save_data()
-    await i.response.send_message(f"✅ สร้างโซน **{name}** ในหมวดหมู่ **{category.name}** แล้ว", ephemeral=True)
+    cfg = data.get('config', {})
+    if 'category_id' in cfg:
+        update_config(i.guild_id, cfg['category_id'], cfg['start_channel_id'], distance)
+        await i.response.send_message(f"🔊 Range set to {distance}", ephemeral=True)
+    else:
+        await i.response.send_message("❌ Please run /setup first", ephemeral=True)
 
-# --- CORE LOGIC ---
-def is_in_zone(x, y, z, pos1, pos2):
-    if not pos1 or not pos2: return False
-    min_x, max_x = min(pos1['x'], pos2['x']), max(pos1['x'], pos2['x'])
-    min_y, max_y = min(pos1['y'], pos2['y']), max(pos1['y'], pos2['y'])
-    min_z, max_z = min(pos1['z'], pos2['z']), max(pos1['z'], pos2['z'])
-    return (min_x <= x <= max_x) and (min_y <= y <= max_y) and (min_z <= z <= max_z)
-
+# --- 🟢 CORE LOGIC: Auto-Move & Disconnect Handling 🟢 ---
 async def process_voice_logic():
     curr = time.time()
     for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
 
     for guild_id, data in server_data.items():
         if not data.get('whitelist', {}).get('active'): continue
+        
         cfg = data.get('config', {})
         if not cfg: continue
 
         guild = bot.get_guild(guild_id)
         if not guild: continue
         
-        main_cat = guild.get_channel(cfg.get('category_id'))
+        cat = guild.get_channel(cfg.get('category_id'))
         start = guild.get_channel(cfg.get('start_channel_id'))
-        if not main_cat or not start: continue
+        if not cat or not start: continue
         
         dist_sq = cfg.get('range', DEFAULT_RANGE) ** 2
-        y_penalty = 3.0 
-        
-        zones = data.get('zones', {})
-        buckets = {'__global__': {'category_id': main_cat.id, 'players': []}}
-        for zname, zdata in zones.items():
-            if zdata.get('category_id'): buckets[zname] = {'category_id': zdata['category_id'], 'players': []}
-        
         users_map = data.get('users', {})
-        for uid, user_info in users_map.items():
-            gamertag = user_info.get('xbox') if isinstance(user_info, dict) else user_info
-            if not gamertag: continue
-            
+        
+        online = []
+        for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
             if not mem or not mem.voice or not mem.voice.channel: continue
+            # เช็คว่าอยู่ใน Category ของบอทหรือไม่ (ถ้าไม่อยู่ ไม่ต้องยุ่ง)
+            if mem.voice.channel.category_id != cat.id: continue
             
+            # ✅ LOGIC 1: เช็คว่าอยู่ในเกมหรือไม่?
             if gamertag in game_state:
+                # ยังอยู่ในเกม -> เก็บข้อมูลไว้จัดกลุ่ม
                 p = game_state[gamertag]
-                px, py, pz = p['x'], p['y'], p['z']
-                
-                current_zone = '__global__'
-                for zname, zdata in zones.items():
-                    if is_in_zone(px, py, pz, zdata.get('pos1'), zdata.get('pos2')):
-                        current_zone = zname
-                        break
-                
-                buckets[current_zone]['players'].append((mem, px, py, pz))
+                online.append((mem, p['x'], p['y'], p['z']))
             else:
+                # ❌ ออกจากเกมแล้ว (Disconnect) -> ย้ายกลับ Lobby
                 if mem.voice.channel.id != start.id:
                     if curr - user_last_move.get(mem.id, 0) > MOVE_COOLDOWN:
                         try: 
@@ -296,55 +302,65 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
+        # --- ถ้าไม่มีคนออนไลน์ในเกม ก็จบการทำงานของรอบนี้ ---
+        if not online: continue
+
+        # ✅ LOGIC 2: จัดกลุ่มคนเล่น (Clustering)
+        groups = []
+        processed = set()
+        for i in range(len(online)):
+            if i in processed: continue
+            m1, x1, y1, z1 = online[i]
+            grp = [m1]
+            processed.add(i)
+            for j in range(i+1, len(online)):
+                if j in processed: continue
+                m2, x2, y2, z2 = online[j]
+                if ((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2) <= dist_sq:
+                    grp.append(m2)
+                    processed.add(j)
+            groups.append(grp)
+            
+        # ✅ LOGIC 3: เลือกห้อง (Few-to-Many & Majority Rule)
+        avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
         taken = set()
-        for b_name, bucket in buckets.items():
-            if not bucket['players']: continue
-            target_cat = guild.get_channel(bucket['category_id'])
-            if not target_cat: continue
-            avail = [c for c in target_cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
-            online = bucket['players']
+        
+        for g in groups:
+            target = None
+            room_counts = {}
+            for m in g:
+                c = m.voice.channel
+                room_counts[c] = room_counts.get(c, 0) + 1
             
-            groups = []
-            processed = set()
-            for i in range(len(online)):
-                if i in processed: continue
-                m1, x1, y1, z1 = online[i]
-                grp = [m1]
-                processed.add(i)
-                for j in range(i+1, len(online)):
-                    if j in processed: continue
-                    m2, x2, y2, z2 = online[j]
-                    if ((x2-x1)**2 + ((y2-y1)*y_penalty)**2 + (z2-z1)**2) <= dist_sq:
-                        grp.append(m2)
-                        processed.add(j)
-                groups.append(grp)
+            # หาห้องที่คนส่วนใหญ่อยู่
+            majority_channel = max(room_counts, key=room_counts.get)
             
-            for g in groups:
-                target = None
-                room_counts = {}
-                for m in g: room_counts[m.voice.channel] = room_counts.get(m.voice.channel, 0) + 1
-                maj_chan = max(room_counts, key=room_counts.get)
-                
-                if maj_chan.category_id != target_cat.id or maj_chan.id == start.id:
-                    target = next((c for c in avail if len(c.members) == 0 and c.id not in taken), None)
-                else: target = maj_chan
-                
-                if not target:
-                    target = next((c for c in avail if c.id not in taken), None)
-                    if not target and avail: target = avail[0] 
-                
-                if not target: continue
-                taken.add(target.id)
-                
-                for m in g:
-                    if m.voice.channel.id != target.id:
-                        if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
-                        try:
-                            await m.move_to(target)
-                            user_last_move[m.id] = curr
-                            await asyncio.sleep(0.2)
-                        except discord.HTTPException as e:
-                            if e.status == 429: await asyncio.sleep(2)
+            if majority_channel.id == start.id:
+                # กรณี A: คนส่วนใหญ่อยู่ Lobby -> หาห้องว่างห้องใหม่ให้ทุกคน
+                for c in avail:
+                    if len(c.members) == 0 and c.id not in taken:
+                        target = c
+                        break
+            else:
+                # กรณี B: คนส่วนใหญ่อยู่ห้องเกม -> ย้ายคนส่วนน้อยไปหา (Few to Many)
+                target = majority_channel
+            
+            if not target:
+                 for c in room_counts:
+                     if c.id != start.id: target = c; break
+            
+            if not target: continue
+            taken.add(target.id)
+            
+            for m in g:
+                if m.voice.channel.id != target.id:
+                    if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
+                    try:
+                        await m.move_to(target)
+                        user_last_move[m.id] = curr
+                        await asyncio.sleep(0.2)
+                    except discord.HTTPException as e:
+                        if e.status == 429: await asyncio.sleep(2)
 
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
@@ -353,5 +369,9 @@ if __name__ == "__main__":
         try:
             bot.is_rate_limited = False
             bot.run(TOKEN)
-        except Exception as e:
-            time.sleep(10)
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                bot.is_rate_limited = True
+                time.sleep(60)
+            else: time.sleep(10)
+        except: time.sleep(30)
