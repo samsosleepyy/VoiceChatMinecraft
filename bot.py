@@ -33,6 +33,8 @@ def load_data():
                 raw_data = json.load(f)
                 server_data = {int(k): v for k, v in raw_data.items()}
                 for gid in server_data:
+                    if 'zones' not in server_data[gid]:
+                        server_data[gid]['zones'] = {}
                     if 'users' in server_data[gid]:
                         server_data[gid]['users'] = {int(uid): tag for uid, tag in server_data[gid]['users'].items()}
             print(f"✅ Loaded Data: {len(server_data)} Servers")
@@ -52,7 +54,7 @@ load_data()
 # --- HELPER FUNCTIONS ---
 def get_guild_data(guild_id):
     if guild_id not in server_data:
-        server_data[guild_id] = {'whitelist': {}, 'config': {}, 'users': {}}
+        server_data[guild_id] = {'whitelist': {}, 'config': {}, 'users': {}, 'zones': {}}
     return server_data[guild_id]
 
 def update_whitelist(guild_id, name, active=True):
@@ -83,6 +85,60 @@ def update_user(guild_id, user_id, gamertag):
     data['users'][user_id] = gamertag
     save_data()
 
+def upsert_zone(guild_id, zone_name, category_id):
+    data = get_guild_data(guild_id)
+    if 'zones' not in data:
+        data['zones'] = {}
+    existing = data['zones'].get(zone_name, {})
+    data['zones'][zone_name] = {
+        'name': zone_name,
+        'category_id': category_id,
+        'active': existing.get('active', True),
+        'corner1': existing.get('corner1'),
+        'corner2': existing.get('corner2')
+    }
+    save_data()
+
+def delete_zone(guild_id, zone_name):
+    data = get_guild_data(guild_id)
+    if 'zones' not in data:
+        data['zones'] = {}
+    if zone_name in data['zones']:
+        del data['zones'][zone_name]
+        save_data()
+        return True
+    return False
+
+def set_zone_bounds(guild_id, zone_name, corner1, corner2):
+    data = get_guild_data(guild_id)
+    zones = data.get('zones', {})
+    if zone_name not in zones:
+        return False
+    zones[zone_name]['corner1'] = corner1
+    zones[zone_name]['corner2'] = corner2
+    save_data()
+    return True
+
+def point_in_zone(pos, zone):
+    c1 = zone.get('corner1')
+    c2 = zone.get('corner2')
+    if not c1 or not c2:
+        return False
+    min_x, max_x = sorted([c1['x'], c2['x']])
+    min_y, max_y = sorted([c1['y'], c2['y']])
+    min_z, max_z = sorted([c1['z'], c2['z']])
+    return (min_x <= pos['x'] <= max_x and
+            min_y <= pos['y'] <= max_y and
+            min_z <= pos['z'] <= max_z)
+
+def resolve_player_zone(data, pos):
+    for zone_name, zone in data.get('zones', {}).items():
+        if not zone.get('active', True):
+            continue
+        if point_in_zone(pos, zone):
+            return zone_name, zone
+    return None, None
+
 # --- BOT SETUP ---
 intents = discord.Intents.default()
 intents.members = True
@@ -98,6 +154,8 @@ class MyBot(commands.Bot):
     async def setup_hook(self):
         app = web.Application()
         app.router.add_post('/update_coords', self.handle_coords)
+        app.router.add_get('/zones', self.handle_zones)
+        app.router.add_post('/zone/bounds', self.handle_zone_bounds)
         app.router.add_get('/', self.handle_index)
         app.router.add_get('/dashboard', self.handle_dashboard)
         app.router.add_post('/dashboard/add', self.handle_dash_add)
@@ -170,6 +228,41 @@ class MyBot(commands.Bot):
         except Exception as e:
             print(f"API Error: {e}")
             return web.json_response({'status': 'error'}, status=500)
+
+    async def handle_zones(self, request):
+        guild_id = request.query.get('guild_id')
+        if not guild_id:
+            return web.json_response({'status': 'error', 'message': 'guild_id required'}, status=400)
+        try:
+            gid = int(guild_id)
+            data = get_guild_data(gid)
+            zones = []
+            for z in data.get('zones', {}).values():
+                zones.append({
+                    'name': z.get('name'),
+                    'category_id': z.get('category_id'),
+                    'active': z.get('active', True),
+                    'has_bounds': bool(z.get('corner1') and z.get('corner2'))
+                })
+            return web.json_response({'status': 'ok', 'zones': zones})
+        except Exception as e:
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+    async def handle_zone_bounds(self, request):
+        try:
+            data = await request.json()
+            if data.get('password') != DASHBOARD_PASSWORD:
+                return web.json_response({'status': 'error', 'message': 'forbidden'}, status=403)
+            gid = int(data['guild_id'])
+            zone_name = data['zone_name']
+            corner1 = data['corner1']
+            corner2 = data['corner2']
+            ok = set_zone_bounds(gid, zone_name, corner1, corner2)
+            if not ok:
+                return web.json_response({'status': 'error', 'message': 'zone not found'}, status=404)
+            return web.json_response({'status': 'ok'})
+        except Exception as e:
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
 
 bot = MyBot()
 
@@ -259,6 +352,29 @@ async def set_range(i: discord.Interaction, distance: int):
     else:
         await i.response.send_message("❌ Please run /setup first", ephemeral=True)
 
+@bot.tree.command(name="zone")
+@app_commands.describe(name="ชื่อโซน", category="หมวดหมู่สำหรับโซนนี้")
+async def set_zone(i: discord.Interaction, name: str, category: discord.CategoryChannel):
+    if not i.user.guild_permissions.administrator:
+        return await i.response.send_message("❌ Admin Only", ephemeral=True)
+    upsert_zone(i.guild_id, name.strip(), category.id)
+    await i.response.send_message(
+        f"✅ Zone `{name}` linked to category **{category.name}**\n"
+        f"Addon pull list: `/zones?guild_id={i.guild_id}`",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="delzone")
+@app_commands.describe(name="ชื่อโซนที่จะลบ")
+async def remove_zone_cmd(i: discord.Interaction, name: str):
+    if not i.user.guild_permissions.administrator:
+        return await i.response.send_message("❌ Admin Only", ephemeral=True)
+    ok = delete_zone(i.guild_id, name.strip())
+    if ok:
+        await i.response.send_message(f"🗑️ Deleted zone `{name}`", ephemeral=True)
+    else:
+        await i.response.send_message(f"⚠️ Zone `{name}` not found", ephemeral=True)
+
 # --- 🟢 CORE LOGIC: Auto-Move & Disconnect Handling 🟢 ---
 async def process_voice_logic():
     curr = time.time()
@@ -273,25 +389,39 @@ async def process_voice_logic():
         guild = bot.get_guild(guild_id)
         if not guild: continue
         
-        cat = guild.get_channel(cfg.get('category_id'))
+        default_cat = guild.get_channel(cfg.get('category_id'))
         start = guild.get_channel(cfg.get('start_channel_id'))
-        if not cat or not start: continue
-        
+        if not default_cat or not start: continue
+
+        managed_category_ids = {default_cat.id}
+        zones = data.get('zones', {})
+        for zone in zones.values():
+            if zone.get('category_id'):
+                managed_category_ids.add(zone['category_id'])
+
         dist_sq = cfg.get('range', DEFAULT_RANGE) ** 2
         users_map = data.get('users', {})
-        
-        online = []
+
+        # bucket_key -> {category_id, players:[(member,x,y,z)]}
+        buckets = {}
         for uid, gamertag in users_map.items():
             mem = guild.get_member(uid)
             if not mem or not mem.voice or not mem.voice.channel: continue
-            # เช็คว่าอยู่ใน Category ของบอทหรือไม่ (ถ้าไม่อยู่ ไม่ต้องยุ่ง)
-            if mem.voice.channel.category_id != cat.id: continue
-            
+            if mem.voice.channel.category_id not in managed_category_ids: continue
+
             # ✅ LOGIC 1: เช็คว่าอยู่ในเกมหรือไม่?
             if gamertag in game_state:
-                # ยังอยู่ในเกม -> เก็บข้อมูลไว้จัดกลุ่ม
                 p = game_state[gamertag]
-                online.append((mem, p['x'], p['y'], p['z']))
+                zone_name, zone_data = resolve_player_zone(data, p)
+                if zone_name:
+                    bucket_key = f"zone::{zone_name}"
+                    category_id = zone_data.get('category_id', default_cat.id)
+                else:
+                    bucket_key = "default"
+                    category_id = default_cat.id
+                if bucket_key not in buckets:
+                    buckets[bucket_key] = {'category_id': category_id, 'players': []}
+                buckets[bucket_key]['players'].append((mem, p['x'], p['y'], p['z']))
             else:
                 # ❌ ออกจากเกมแล้ว (Disconnect) -> ย้ายกลับ Lobby
                 if mem.voice.channel.id != start.id:
@@ -302,65 +432,72 @@ async def process_voice_logic():
                             await asyncio.sleep(0.2)
                         except: pass
         
-        # --- ถ้าไม่มีคนออนไลน์ในเกม ก็จบการทำงานของรอบนี้ ---
-        if not online: continue
+        if not buckets:
+            continue
 
-        # ✅ LOGIC 2: จัดกลุ่มคนเล่น (Clustering)
-        groups = []
-        processed = set()
-        for i in range(len(online)):
-            if i in processed: continue
-            m1, x1, y1, z1 = online[i]
-            grp = [m1]
-            processed.add(i)
-            for j in range(i+1, len(online)):
-                if j in processed: continue
-                m2, x2, y2, z2 = online[j]
-                if ((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2) <= dist_sq:
-                    grp.append(m2)
-                    processed.add(j)
-            groups.append(grp)
-            
-        # ✅ LOGIC 3: เลือกห้อง (Few-to-Many & Majority Rule)
-        avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
-        taken = set()
-        
-        for g in groups:
-            target = None
-            room_counts = {}
-            for m in g:
-                c = m.voice.channel
-                room_counts[c] = room_counts.get(c, 0) + 1
-            
-            # หาห้องที่คนส่วนใหญ่อยู่
-            majority_channel = max(room_counts, key=room_counts.get)
-            
-            if majority_channel.id == start.id:
-                # กรณี A: คนส่วนใหญ่อยู่ Lobby -> หาห้องว่างห้องใหม่ให้ทุกคน
-                for c in avail:
-                    if len(c.members) == 0 and c.id not in taken:
-                        target = c
-                        break
-            else:
-                # กรณี B: คนส่วนใหญ่อยู่ห้องเกม -> ย้ายคนส่วนน้อยไปหา (Few to Many)
-                target = majority_channel
-            
-            if not target:
-                 for c in room_counts:
-                     if c.id != start.id: target = c; break
-            
-            if not target: continue
-            taken.add(target.id)
-            
-            for m in g:
-                if m.voice.channel.id != target.id:
-                    if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
-                    try:
-                        await m.move_to(target)
-                        user_last_move[m.id] = curr
-                        await asyncio.sleep(0.2)
-                    except discord.HTTPException as e:
-                        if e.status == 429: await asyncio.sleep(2)
+        for bucket in buckets.values():
+            players = bucket['players']
+            target_category = guild.get_channel(bucket['category_id'])
+            if not target_category:
+                target_category = default_cat
+
+            # ✅ LOGIC 2: จัดกลุ่มคนเล่น (Clustering by range)
+            groups = []
+            processed = set()
+            for i in range(len(players)):
+                if i in processed: continue
+                m1, x1, y1, z1 = players[i]
+                grp = [m1]
+                processed.add(i)
+                for j in range(i + 1, len(players)):
+                    if j in processed: continue
+                    m2, x2, y2, z2 = players[j]
+                    if ((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2) <= dist_sq:
+                        grp.append(m2)
+                        processed.add(j)
+                groups.append(grp)
+
+            # ✅ LOGIC 3: เลือกห้องใน category ของ bucket เท่านั้น
+            avail = [c for c in target_category.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
+            taken = set()
+
+            for g in groups:
+                target = None
+                room_counts = {}
+                for m in g:
+                    c = m.voice.channel
+                    # ไม่ให้นับห้องนอก category ของ bucket
+                    if c.category_id != target_category.id:
+                        continue
+                    room_counts[c] = room_counts.get(c, 0) + 1
+
+                if room_counts:
+                    majority_channel = max(room_counts, key=room_counts.get)
+                    if majority_channel.id != start.id:
+                        target = majority_channel
+
+                if not target:
+                    for c in avail:
+                        if len(c.members) == 0 and c.id not in taken:
+                            target = c
+                            break
+
+                if not target and avail:
+                    target = avail[0]
+
+                if not target:
+                    continue
+
+                taken.add(target.id)
+                for m in g:
+                    if m.voice.channel.id != target.id:
+                        if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN: continue
+                        try:
+                            await m.move_to(target)
+                            user_last_move[m.id] = curr
+                            await asyncio.sleep(0.2)
+                        except discord.HTTPException as e:
+                            if e.status == 429: await asyncio.sleep(2)
 
 if __name__ == "__main__":
     if not TOKEN: sys.exit(1)
