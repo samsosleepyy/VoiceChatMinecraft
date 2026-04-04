@@ -24,8 +24,10 @@ game_state = {}
 user_last_move = {}
 testing_guilds = set()
 DYNAMIC_RANGE = DEFAULT_RANGE
-active_calls = {} 
+active_call_groups = []
+active_call_lookup = {}
 zones_state = {}
+random_call_opt_in = {}
 
 # --- ระบบจัดเก็บข้อมูล ---
 def load_data():
@@ -49,8 +51,12 @@ def load_data():
                         gdata['users'] = new_users
                     if 'zones' in gdata and isinstance(gdata['zones'], dict):
                         for zname, zdata in gdata['zones'].items():
-                            if isinstance(zdata, dict) and 'voice_channel_id' in zdata and 'category_id' not in zdata:
-                                zdata.pop('voice_channel_id', None)
+                            if isinstance(zdata, dict):
+                                if 'voice_channel_id' in zdata and 'category_id' not in zdata:
+                                    zdata.pop('voice_channel_id', None)
+                                normalized_range = normalize_zone_range(zdata.get('range'))
+                                if normalized_range is not None:
+                                    zdata['range'] = normalized_range
                 
                 server_data = temp_data
             print(f"[ระบบ] โหลดข้อมูลสำเร็จ: {len(server_data)} เซิร์ฟเวอร์")
@@ -107,19 +113,25 @@ def get_zone_map(guild_id):
         data['zones'] = {}
     return data['zones']
 
-def upsert_zone(guild_id, zone_name, category_id=None):
+def upsert_zone(guild_id, zone_name, category_id=None, zone_range=None):
     zones = get_zone_map(guild_id)
     zone = zones.get(zone_name, {})
     if category_id is not None:
         zone['category_id'] = category_id
+    normalized_range = normalize_zone_range(zone_range)
+    if normalized_range is not None:
+        zone['range'] = normalized_range
     zone['name'] = zone_name
     zones[zone_name] = zone
     save_data()
     return zone
 
-def set_zone_bounds(guild_id, zone_name, min_point, max_point):
-    zone = upsert_zone(guild_id, zone_name)
+def set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=None):
+    zone = upsert_zone(guild_id, zone_name, zone_range=zone_range)
     zone['bounds'] = {'min': min_point, 'max': max_point}
+    normalized_range = normalize_zone_range(zone_range)
+    if normalized_range is not None:
+        zone['range'] = normalized_range
     save_data()
     return zone
 
@@ -148,6 +160,84 @@ def find_player_zone(guild_id, point):
             return name, zone
     return None, None
 
+
+def normalize_zone_range(zone_range):
+    try:
+        zone_range = int(zone_range)
+    except (TypeError, ValueError):
+        zone_range = None
+    if zone_range is None or zone_range <= 0:
+        return None
+    return zone_range
+
+def build_call_groups(call_payload):
+    groups = []
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(a, b):
+        if not a or not b:
+            return
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    explicit_groups = []
+
+    for item in call_payload or []:
+        if isinstance(item, dict):
+            members = item.get('members') or item.get('participants') or item.get('users')
+            if isinstance(members, list):
+                cleaned = [str(m).strip() for m in members if str(m).strip()]
+                if len(cleaned) >= 2:
+                    explicit_groups.append(cleaned)
+                continue
+            p1 = str(item.get('p1') or '').strip()
+            p2 = str(item.get('p2') or '').strip()
+            if p1 and p2:
+                union(p1, p2)
+        elif isinstance(item, (list, tuple, set)):
+            cleaned = [str(m).strip() for m in item if str(m).strip()]
+            if len(cleaned) >= 2:
+                explicit_groups.append(cleaned)
+
+    grouped = {}
+    for member in list(parent.keys()):
+        root = find(member)
+        grouped.setdefault(root, set()).add(member)
+
+    for members in explicit_groups:
+        first = members[0]
+        for other in members[1:]:
+            union(first, other)
+
+    # rebuild after explicit unions
+    grouped = {}
+    for member in list(parent.keys()):
+        root = find(member)
+        grouped.setdefault(root, set()).add(member)
+
+    for members in explicit_groups:
+        root = find(members[0])
+        grouped.setdefault(root, set()).update(members)
+
+    groups = [sorted(list(v)) for v in grouped.values() if len(v) >= 2]
+    groups.sort(key=lambda g: (-len(g), g))
+    return groups
+
+def rebuild_active_call_lookup():
+    global active_call_lookup
+    active_call_lookup = {}
+    for idx, members in enumerate(active_call_groups):
+        for member in members:
+            active_call_lookup[member] = idx
+
+
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
@@ -164,6 +254,7 @@ class MyBot(commands.Bot):
         app.router.add_post('/update_coords', self.handle_coords)
         app.router.add_get('/zones', self.handle_zones)
         app.router.add_post('/zone/bounds', self.handle_zone_bounds)
+        app.router.add_post('/random/toggle', self.handle_random_toggle)
         app.router.add_get('/', self.handle_index)
         app.router.add_get('/dashboard', self.handle_dashboard)
         app.router.add_post('/dashboard/add', self.handle_dash_add)
@@ -190,7 +281,8 @@ class MyBot(commands.Bot):
                 zones.append({
                     'name': name,
                     'has_bounds': bool(zone.get('bounds')),
-                    'category_id': zone.get('category_id')
+                    'category_id': zone.get('category_id'),
+                    'range': zone.get('range')
                 })
             zones.sort(key=lambda z: z['name'])
             return web.json_response({'status': 'ok', 'zones': zones})
@@ -208,13 +300,26 @@ class MyBot(commands.Bot):
             zone_name = str(data.get('zone_name') or '').strip()
             min_point = data.get('min') or {}
             max_point = data.get('max') or {}
+            zone_range = data.get('range')
             if guild_id <= 0 or not zone_name:
                 return web.json_response({'status': 'error', 'message': 'invalid guild_id or zone_name'}, status=400)
             required = ['x', 'y', 'z']
             if not all(k in min_point for k in required) or not all(k in max_point for k in required):
                 return web.json_response({'status': 'error', 'message': 'invalid bounds'}, status=400)
-            zone = set_zone_bounds(guild_id, zone_name, min_point, max_point)
+            zone = set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=zone_range)
             return web.json_response({'status': 'ok', 'zone': zone})
+        except Exception as e:
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+    async def handle_random_toggle(self, request):
+        try:
+            data = await request.json()
+            gamertag = str(data.get('player') or data.get('gamertag') or '').strip()
+            enabled = bool(data.get('enabled', True))
+            if not gamertag:
+                return web.json_response({'status': 'error', 'message': 'missing player'}, status=400)
+            random_call_opt_in[gamertag] = enabled
+            return web.json_response({'status': 'ok', 'player': gamertag, 'enabled': enabled})
         except Exception as e:
             return web.json_response({'status': 'error', 'message': str(e)}, status=500)
 
@@ -243,44 +348,47 @@ class MyBot(commands.Bot):
             data = await request.json()
             global game_state
             global DYNAMIC_RANGE
-            global active_calls
+            global active_call_groups
 
             user_list = []
-            server_calls = [] 
+            server_calls = []
 
             if isinstance(data, dict):
                 user_list = data.get('users', [])
                 received_range = data.get('range')
-                if received_range: DYNAMIC_RANGE = int(received_range)
-                server_calls = data.get('calls', []) 
-            elif isinstance(data, list): 
+                if received_range:
+                    try:
+                        DYNAMIC_RANGE = int(received_range)
+                    except (TypeError, ValueError):
+                        pass
+                server_calls = data.get('calls', [])
+            elif isinstance(data, list):
                 user_list = data
 
             current = {}
-            for p in user_list: 
-                current[p['name']] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
+            for p in user_list:
+                name = str(p.get('name') or '').strip()
+                if not name:
+                    continue
+                current[name] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
             game_state = current
-            
-            active_calls.clear()
-            for c in server_calls:
-                p1, p2 = c.get('p1'), c.get('p2')
-                if p1 and p2:
-                    active_calls[p1] = p2
-                    active_calls[p2] = p1
+
+            active_call_groups = build_call_groups(server_calls)
+            rebuild_active_call_lookup()
 
             all_ic_map = {}
             for gid, gdata in server_data.items():
                 for uid, udata in gdata.get('users', {}).items():
                     if isinstance(udata, dict):
                         all_ic_map[udata['gamertag']] = udata['ic_name']
-                    elif isinstance(udata, str): 
+                    elif isinstance(udata, str):
                         all_ic_map[udata] = udata
 
             if not self.is_rate_limited:
                 await process_voice_logic()
-            
+
             return web.json_response({'status': 'ok', 'ic_map': all_ic_map})
-            
+
         except Exception as e:
             print(f"เกิดข้อผิดพลาดในการรับข้อมูล: {e}")
             return web.json_response({'status': 'error'}, status=500)
@@ -368,14 +476,14 @@ async def set_range(i: discord.Interaction, distance: int):
         await i.response.send_message("โปรดพิมพ์คำสั่ง /setup ก่อนใช้งานคำสั่งนี้", ephemeral=True)
 
 @bot.tree.command(name="zone")
-async def zone_create(i: discord.Interaction, name: str, category: discord.CategoryChannel):
+async def zone_create(i: discord.Interaction, name: str, category: discord.CategoryChannel, range_val: int = None):
     if not i.user.guild_permissions.administrator:
         return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
-    zone = upsert_zone(i.guild_id, name.strip(), category.id)
+    zone = upsert_zone(i.guild_id, name.strip(), category.id, range_val)
     has_bounds = 'bounds' in zone
     voice_count = sum(1 for ch in category.channels if isinstance(ch, discord.VoiceChannel))
     await i.response.send_message(
-        f"สร้าง/อัปเดตโซน **{name}** เรียบร้อยแล้ว\nหมวดหมู่: **{category.name}**\nจำนวนห้องเสียงในหมวด: **{voice_count}**\nสถานะขอบเขต: {'ตั้งแล้ว' if has_bounds else 'ยังไม่ได้ตั้ง'}",
+        f"สร้าง/อัปเดตโซน **{name}** เรียบร้อยแล้ว\nหมวดหมู่: **{category.name}**\nจำนวนห้องเสียงในหมวด: **{voice_count}**\nสถานะขอบเขต: {'ตั้งแล้ว' if has_bounds else 'ยังไม่ได้ตั้ง'}\nระยะไมค์โซน: **{zone.get('range', 'ใช้ค่าเริ่มต้น')}**",
         ephemeral=True
     )
 
@@ -396,8 +504,20 @@ async def zone_list_cmd(i: discord.Interaction):
     lines = []
     for name, zone in sorted(zone_map.items()):
         cat_obj = i.guild.get_channel(zone.get('category_id')) if zone.get('category_id') else None
-        lines.append(f"• **{name}** → หมวด: {cat_obj.name if cat_obj else 'ไม่มีหมวด'} | bounds: {'set' if zone.get('bounds') else 'unset'}")
+        lines.append(f"• **{name}** → หมวด: {cat_obj.name if cat_obj else 'ไม่มีหมวด'} | bounds: {'set' if zone.get('bounds') else 'unset'} | range: {zone.get('range', 'default')}")
     await i.response.send_message("\n".join(lines), ephemeral=True)
+
+@bot.tree.command(name="zonerange")
+async def zone_range_cmd(i: discord.Interaction, name: str, distance: int):
+    if not i.user.guild_permissions.administrator:
+        return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
+    zones = get_zone_map(i.guild_id)
+    zone = zones.get(name.strip())
+    if not zone:
+        return await i.response.send_message(f"ไม่พบโซน **{name}**", ephemeral=True)
+    zone['range'] = distance
+    save_data()
+    await i.response.send_message(f"ตั้งค่าระยะไมค์ของโซน **{name}** เป็น **{distance}** บล็อกแล้ว", ephemeral=True)
 
 @bot.tree.command(name="test")
 async def test_mode(interaction: discord.Interaction):
@@ -413,7 +533,7 @@ async def test_mode(interaction: discord.Interaction):
         await interaction.followup.send("โหมดทดสอบ: เปิดการใช้งาน (บอทจะตามพิกัดของหุ่น botvc ในเกม)", ephemeral=True)
 
 # --- ระบบจัดการห้องและตำแหน่ง (Center of Mass Clustering) ---
-async def assign_groups_in_category(guild, members_with_pos, category, fallback_channel, taken_rooms, curr):
+async def assign_groups_in_category(guild, members_with_pos, category, fallback_channel, taken_rooms, curr, active_range=None):
     if not members_with_pos or not category:
         return
 
@@ -422,8 +542,9 @@ async def assign_groups_in_category(guild, members_with_pos, category, fallback_
         return
 
     config_range = get_guild_data(guild.id).get('config', {}).get('range', DEFAULT_RANGE)
-    active_range = DYNAMIC_RANGE if DYNAMIC_RANGE > 0 else config_range
-    dist_sq = active_range ** 2
+    if active_range is None:
+        active_range = DYNAMIC_RANGE if DYNAMIC_RANGE > 0 else config_range
+    dist_sq = max(int(active_range), 1) ** 2
 
     clusters = []
     for m, x, y, z in members_with_pos:
@@ -519,20 +640,25 @@ async def assign_groups_in_category(guild, members_with_pos, category, fallback_
 
 async def process_voice_logic():
     curr = time.time()
-    for u in [k for k,v in user_last_move.items() if curr-v > 60]: del user_last_move[u]
+    for u in [k for k, v in user_last_move.items() if curr - v > 60]:
+        del user_last_move[u]
 
     for guild_id, data in server_data.items():
-        if not data.get('whitelist', {}).get('active'): continue
+        if not data.get('whitelist', {}).get('active'):
+            continue
         cfg = data.get('config', {})
-        if not cfg: continue
+        if not cfg:
+            continue
 
         guild = bot.get_guild(guild_id)
-        if not guild: continue
-        
+        if not guild:
+            continue
+
         cat = guild.get_channel(cfg.get('category_id'))
         start = guild.get_channel(cfg.get('start_channel_id'))
-        if not cat or not start: continue
-        
+        if not cat or not start:
+            continue
+
         users_map = data.get('users', {})
 
         online = []
@@ -540,6 +666,7 @@ async def process_voice_logic():
         zoned_online = {}
         in_call_users = set()
         tag_to_member = {}
+        tag_to_point = {}
         managed_category_ids = {cfg.get('category_id')}
         for zone in get_zone_map(guild_id).values():
             if zone.get('category_id'):
@@ -556,7 +683,11 @@ async def process_voice_logic():
 
             tag_to_member[gamertag] = mem
 
-            if gamertag in active_calls:
+            if gamertag in game_state:
+                p = game_state[gamertag]
+                tag_to_point[gamertag] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
+
+            if gamertag in active_call_lookup:
                 in_call_users.add(uid)
                 continue
 
@@ -582,65 +713,94 @@ async def process_voice_logic():
                     break
             if found_botvc and botvc_coords:
                 online.append((guild.me, botvc_coords['x'], botvc_coords['y'], botvc_coords['z']))
+                tag_to_member['botvc'] = guild.me
+                tag_to_point['botvc'] = botvc_coords
             elif not found_botvc:
                 if guild.voice_client:
                     await guild.voice_client.disconnect()
 
-        processed_calls = set()
         taken_rooms = set()
 
-        for tag1, tag2 in active_calls.items():
-            if tag1 in processed_calls:
+        for call_group in active_call_groups:
+            members = []
+            zone_names = set()
+            zone_categories = []
+            for tag in call_group:
+                mem = tag_to_member.get(tag)
+                if not mem and (tag == "botvc" or str(tag).startswith("botvc_")) and guild_id in testing_guilds:
+                    mem = guild.me
+                if not mem:
+                    continue
+                members.append((tag, mem))
+                point = tag_to_point.get(tag)
+                if point:
+                    zone_name, zone = find_player_zone(guild_id, point)
+                    if zone_name and zone and zone.get('category_id'):
+                        zone_names.add(zone_name)
+                        zone_categories.append(zone.get('category_id'))
+
+            if len(members) < 2:
                 continue
 
-            m1 = tag_to_member.get(tag1)
-            m2 = tag_to_member.get(tag2)
+            target_category = cat
+            if len(zone_names) == 1 and zone_categories:
+                maybe_cat = guild.get_channel(zone_categories[0])
+                if isinstance(maybe_cat, discord.CategoryChannel):
+                    target_category = maybe_cat
 
-            if m1 and (tag2 == "botvc" or tag2.startswith("botvc_")):
-                if guild_id in testing_guilds:
-                    m2 = guild.me
+            voice_channels = [c for c in target_category.channels if isinstance(c, discord.VoiceChannel)]
+            if target_category == cat:
+                voice_channels = [c for c in voice_channels if c.id != start.id]
 
-            if m1 and m2:
-                target_room = None
-                if m1.voice and m2.voice and m1.voice.channel.id == m2.voice.channel.id:
-                    if len(m1.voice.channel.members) == 2:
-                        target_room = m1.voice.channel
-                elif m2 == guild.me and m1.voice:
-                    pass
+            target_room = None
+            current_rooms = {}
+            for _, mem in members:
+                if mem != guild.me and mem.voice and mem.voice.channel and mem.voice.channel.category_id == target_category.id:
+                    current_rooms[mem.voice.channel] = current_rooms.get(mem.voice.channel, 0) + 1
 
-                if not target_room:
-                    avail = [c for c in cat.channels if isinstance(c, discord.VoiceChannel) and c.id != start.id]
-                    for c in avail:
-                        if len(c.members) == 0 and c.id not in taken_rooms:
-                            target_room = c
-                            break
+            if current_rooms:
+                majority_channel = max(current_rooms, key=current_rooms.get)
+                if majority_channel.id not in taken_rooms:
+                    target_room = majority_channel
 
-                if target_room:
-                    taken_rooms.add(target_room.id)
-                    processed_calls.add(tag1)
-                    processed_calls.add(tag2)
+            if not target_room:
+                for c in voice_channels:
+                    if len(c.members) == 0 and c.id not in taken_rooms:
+                        target_room = c
+                        break
 
-                    if m1.voice and m1.voice.channel.id != target_room.id:
+            if not target_room:
+                for c in voice_channels:
+                    if c.id not in taken_rooms:
+                        target_room = c
+                        break
+
+            if not target_room:
+                continue
+
+            taken_rooms.add(target_room.id)
+
+            for _, mem in members:
+                if mem == guild.me:
+                    if guild.voice_client:
+                        if guild.voice_client.channel.id != target_room.id:
+                            await guild.voice_client.move_to(target_room)
+                    else:
                         try:
-                            await m1.move_to(target_room)
-                            user_last_move[m1.id] = curr
+                            await target_room.connect()
                         except:
                             pass
-                    if m2 != guild.me and m2.voice and m2.voice.channel.id != target_room.id:
-                        try:
-                            await m2.move_to(target_room)
-                            user_last_move[m2.id] = curr
-                        except:
-                            pass
-                    if m2 == guild.me:
-                        if guild.voice_client:
-                            if guild.voice_client.channel.id != target_room.id:
-                                await guild.voice_client.move_to(target_room)
-                        else:
-                            try:
-                                await target_room.connect()
-                            except:
-                                pass
+                    continue
+
+                if mem.voice and mem.voice.channel and mem.voice.channel.id != target_room.id:
+                    if curr - user_last_move.get(mem.id, 0) < MOVE_COOLDOWN:
+                        continue
+                    try:
+                        await mem.move_to(target_room)
+                        user_last_move[mem.id] = curr
+                        await asyncio.sleep(0.2)
+                    except:
+                        pass
 
         for mem, x, y, z in online:
             if mem != guild.me and mem.id in in_call_users:
@@ -648,16 +808,25 @@ async def process_voice_logic():
             zone_name, zone = find_player_zone(guild_id, {'x': x, 'y': y, 'z': z})
             zone_category = guild.get_channel(zone.get('category_id')) if zone_name and zone and zone.get('category_id') else None
             if zone_name and isinstance(zone_category, discord.CategoryChannel):
-                zoned_online.setdefault(zone_name, {'category': zone_category, 'members': []})['members'].append((mem, x, y, z))
+                zoned_online.setdefault(zone_name, {'category': zone_category, 'members': [], 'range': zone.get('range')})['members'].append((mem, x, y, z))
             else:
                 unzoned_online.append((mem, x, y, z))
 
         for zone_name, zone_info in zoned_online.items():
-            await assign_groups_in_category(guild, zone_info['members'], zone_info['category'], None, taken_rooms, curr)
+            await assign_groups_in_category(
+                guild,
+                zone_info['members'],
+                zone_info['category'],
+                None,
+                taken_rooms,
+                curr,
+                active_range=zone_info.get('range')
+            )
 
-        await assign_groups_in_category(guild, unzoned_online, cat, start, taken_rooms, curr)
+        await assign_groups_in_category(guild, unzoned_online, cat, start, taken_rooms, curr, active_range=None)
 
 if __name__ == "__main__":
+
     if not TOKEN: sys.exit(1)
     time.sleep(random.randint(5, 10))
     while True:
