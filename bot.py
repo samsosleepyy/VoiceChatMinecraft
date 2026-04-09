@@ -28,6 +28,7 @@ active_call_groups = []
 active_call_lookup = {}
 zones_state = {}
 random_call_opt_in = {}
+audio_state = {}
 
 # --- ระบบจัดเก็บข้อมูล ---
 def load_data():
@@ -349,6 +350,7 @@ class MyBot(commands.Bot):
             global game_state
             global DYNAMIC_RANGE
             global active_call_groups
+            global audio_state
 
             user_list = []
             server_calls = []
@@ -366,12 +368,18 @@ class MyBot(commands.Bot):
                 user_list = data
 
             current = {}
+            new_audio_state = {}
             for p in user_list:
                 name = str(p.get('name') or '').strip()
                 if not name:
                     continue
                 current[name] = {'x': p['x'], 'y': p['y'], 'z': p['z']}
+                new_audio_state[name] = {
+                    'mic_disabled': bool(p.get('mic_disabled', False)),
+                    'headphone_disabled': bool(p.get('headphone_disabled', False))
+                }
             game_state = current
+            audio_state = new_audio_state
 
             active_call_groups = build_call_groups(server_calls)
             rebuild_active_call_lookup()
@@ -680,6 +688,16 @@ async def process_voice_logic():
                 continue
             if mem.voice.channel.category_id not in managed_category_ids:
                 continue
+
+            prefs = audio_state.get(gamertag, {})
+            want_mute = bool(prefs.get('mic_disabled', False))
+            want_deaf = bool(prefs.get('headphone_disabled', False))
+            if mem.voice.mute != want_mute or mem.voice.deaf != want_deaf:
+                try:
+                    await mem.edit(mute=want_mute, deafen=want_deaf)
+                    await asyncio.sleep(0.1)
+                except:
+                    pass
 
             tag_to_member[gamertag] = mem
 
