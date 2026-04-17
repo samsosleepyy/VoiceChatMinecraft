@@ -19,6 +19,9 @@ DEFAULT_RANGE = 10
 DATA_FILE = "server_data.json"
 MOVE_COOLDOWN = 3.0
 
+ALLOWED_GUILD_IDS = {1441795602550882334}
+OWNER_USER_IDS = {904046392106967122}
+
 server_data = {}  
 game_state = {}   
 user_last_move = {}
@@ -238,6 +241,12 @@ def rebuild_active_call_lookup():
         for member in members:
             active_call_lookup[member] = idx
 
+def is_owner_or_admin(interaction: discord.Interaction):
+    return bool(
+        interaction.user.id in OWNER_USER_IDS or
+        getattr(interaction.user.guild_permissions, "administrator", False)
+    )
+
 
 intents = discord.Intents.default()
 intents.members = True
@@ -406,9 +415,14 @@ bot = MyBot()
 @bot.event
 async def on_guild_join(guild):
     data = get_guild_data(guild.id)
+    if guild.id in ALLOWED_GUILD_IDS:
+        update_whitelist(guild.id, guild.name, True)
+        return
     if not data.get('whitelist'):
-        try: await guild.leave()
-        except: pass
+        try:
+            await guild.leave()
+        except:
+            pass
     else:
         update_whitelist(guild.id, guild.name, data['whitelist'].get('active', True))
 
@@ -458,7 +472,7 @@ class SetupView(ui.View):
 @bot.tree.command(name="setup")
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
     if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
-    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
+    if not is_owner_or_admin(interaction): return await interaction.followup.send("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     
     update_whitelist(interaction.guild_id, interaction.guild.name)
     update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
@@ -469,7 +483,7 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
 
 @bot.tree.command(name="whitelist")
 async def wl(i: discord.Interaction, server_id: str):
-    if not i.user.guild_permissions.administrator: return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
+    if not is_owner_or_admin(i): return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     update_whitelist(int(server_id), "Added via Cmd")
     await i.response.send_message(f"เพิ่มรายชื่อเซิร์ฟเวอร์สำเร็จ: {server_id}", ephemeral=True)
 
@@ -485,7 +499,7 @@ async def set_range(i: discord.Interaction, distance: int):
 
 @bot.tree.command(name="zone")
 async def zone_create(i: discord.Interaction, name: str, category: discord.CategoryChannel, range_val: int = None):
-    if not i.user.guild_permissions.administrator:
+    if not is_owner_or_admin(i):
         return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     zone = upsert_zone(i.guild_id, name.strip(), category.id, range_val)
     has_bounds = 'bounds' in zone
@@ -497,14 +511,14 @@ async def zone_create(i: discord.Interaction, name: str, category: discord.Categ
 
 @bot.tree.command(name="delzone")
 async def zone_delete(i: discord.Interaction, name: str):
-    if not i.user.guild_permissions.administrator:
+    if not is_owner_or_admin(i):
         return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     ok = delete_zone(i.guild_id, name.strip())
     await i.response.send_message((f"ลบโซน **{name}** เรียบร้อยแล้ว" if ok else f"ไม่พบโซน **{name}**"), ephemeral=True)
 
 @bot.tree.command(name="zones")
 async def zone_list_cmd(i: discord.Interaction):
-    if not i.user.guild_permissions.administrator:
+    if not is_owner_or_admin(i):
         return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     zone_map = get_zone_map(i.guild_id)
     if not zone_map:
@@ -517,7 +531,7 @@ async def zone_list_cmd(i: discord.Interaction):
 
 @bot.tree.command(name="zonerange")
 async def zone_range_cmd(i: discord.Interaction, name: str, distance: int):
-    if not i.user.guild_permissions.administrator:
+    if not is_owner_or_admin(i):
         return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     zones = get_zone_map(i.guild_id)
     zone = zones.get(name.strip())
@@ -530,7 +544,7 @@ async def zone_range_cmd(i: discord.Interaction, name: str, distance: int):
 @bot.tree.command(name="test")
 async def test_mode(interaction: discord.Interaction):
     if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
-    if not interaction.user.guild_permissions.administrator: return await interaction.followup.send("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
+    if not is_owner_or_admin(interaction): return await interaction.followup.send("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
     gid = interaction.guild_id
     if gid in testing_guilds:
         testing_guilds.remove(gid)
