@@ -61,6 +61,19 @@ def load_data():
                                 normalized_range = normalize_zone_range(zdata.get('range'))
                                 if normalized_range is not None:
                                     zdata['range'] = normalized_range
+                                if 'parts' not in zdata or not isinstance(zdata.get('parts'), list):
+                                    if isinstance(zdata.get('bounds'), dict):
+                                        zdata['parts'] = [zdata['bounds']]
+                                    else:
+                                        zdata['parts'] = []
+                                else:
+                                    cleaned_parts = []
+                                    for part in zdata.get('parts', []):
+                                        if isinstance(part, dict) and isinstance(part.get('min'), dict) and isinstance(part.get('max'), dict):
+                                            cleaned_parts.append({'min': part['min'], 'max': part['max']})
+                                    zdata['parts'] = cleaned_parts
+                                if zdata.get('parts'):
+                                    zdata['bounds'] = zdata['parts'][0]
                 
                 server_data = temp_data
             print(f"[ระบบ] โหลดข้อมูลสำเร็จ: {len(server_data)} เซิร์ฟเวอร์")
