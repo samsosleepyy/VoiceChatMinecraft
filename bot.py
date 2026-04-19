@@ -130,9 +130,16 @@ def upsert_zone(guild_id, zone_name, category_id=None, zone_range=None):
     save_data()
     return zone
 
-def set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=None):
+def set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=None, append_part=False):
     zone = upsert_zone(guild_id, zone_name, zone_range=zone_range)
-    zone['bounds'] = {'min': min_point, 'max': max_point}
+    new_bounds = {'min': min_point, 'max': max_point}
+    parts = zone.get('parts') if isinstance(zone.get('parts'), list) else []
+    if append_part:
+        parts.append(new_bounds)
+    else:
+        parts = [new_bounds]
+    zone['parts'] = parts
+    zone['bounds'] = parts[0] if parts else new_bounds
     normalized_range = normalize_zone_range(zone_range)
     if normalized_range is not None:
         zone['range'] = normalized_range
@@ -159,9 +166,12 @@ def point_in_bounds(point, bounds):
 def find_player_zone(guild_id, point):
     zones = get_zone_map(guild_id)
     for name, zone in zones.items():
-        bounds = zone.get('bounds')
-        if bounds and point_in_bounds(point, bounds):
-            return name, zone
+        parts = zone.get('parts') if isinstance(zone.get('parts'), list) else []
+        if not parts and isinstance(zone.get('bounds'), dict):
+            parts = [zone['bounds']]
+        for bounds in parts:
+            if bounds and point_in_bounds(point, bounds):
+                return name, zone
     return None, None
 
 
@@ -288,9 +298,13 @@ class MyBot(commands.Bot):
             zone_map = get_zone_map(guild_id)
             zones = []
             for name, zone in zone_map.items():
+                parts = zone.get('parts') if isinstance(zone.get('parts'), list) else []
+                if not parts and isinstance(zone.get('bounds'), dict):
+                    parts = [zone.get('bounds')]
                 zones.append({
                     'name': name,
-                    'has_bounds': bool(zone.get('bounds')),
+                    'has_bounds': bool(parts),
+                    'part_count': len(parts),
                     'category_id': zone.get('category_id'),
                     'range': zone.get('range')
                 })
@@ -311,12 +325,13 @@ class MyBot(commands.Bot):
             min_point = data.get('min') or {}
             max_point = data.get('max') or {}
             zone_range = data.get('range')
+            append_part = bool(data.get('append_part', False))
             if guild_id <= 0 or not zone_name:
                 return web.json_response({'status': 'error', 'message': 'invalid guild_id or zone_name'}, status=400)
             required = ['x', 'y', 'z']
             if not all(k in min_point for k in required) or not all(k in max_point for k in required):
                 return web.json_response({'status': 'error', 'message': 'invalid bounds'}, status=400)
-            zone = set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=zone_range)
+            zone = set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=zone_range, append_part=append_part)
             return web.json_response({'status': 'ok', 'zone': zone})
         except Exception as e:
             return web.json_response({'status': 'error', 'message': str(e)}, status=500)
@@ -526,7 +541,10 @@ async def zone_list_cmd(i: discord.Interaction):
     lines = []
     for name, zone in sorted(zone_map.items()):
         cat_obj = i.guild.get_channel(zone.get('category_id')) if zone.get('category_id') else None
-        lines.append(f"• **{name}** → หมวด: {cat_obj.name if cat_obj else 'ไม่มีหมวด'} | bounds: {'set' if zone.get('bounds') else 'unset'} | range: {zone.get('range', 'default')}")
+        parts = zone.get('parts') if isinstance(zone.get('parts'), list) else []
+        if not parts and zone.get('bounds'):
+            parts = [zone.get('bounds')]
+        lines.append(f"• **{name}** → หมวด: {cat_obj.name if cat_obj else 'ไม่มีหมวด'} | parts: {len(parts)} | bounds: {'set' if parts else 'unset'} | range: {zone.get('range', 'default')}")
     await i.response.send_message("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(name="zonerange")
