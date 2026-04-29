@@ -35,6 +35,7 @@ active_call_lookup = {}
 zones_state = {}
 random_call_opt_in = {}
 audio_state = {}
+room_sessions = {}
 
 # --- ระบบจัดเก็บข้อมูล ---
 def load_data():
@@ -77,6 +78,27 @@ def load_data():
                                     zdata['parts'] = cleaned_parts
                                 if zdata.get('parts'):
                                     zdata['bounds'] = zdata['parts'][0]
+                                rooms = zdata.get('rooms')
+                                if not isinstance(rooms, list):
+                                    rooms = []
+                                cleaned_rooms = []
+                                for idx, room in enumerate(rooms):
+                                    if not isinstance(room, dict):
+                                        continue
+                                    if isinstance(room.get('bounds'), dict):
+                                        bounds = room.get('bounds')
+                                        minp = bounds.get('min') if isinstance(bounds.get('min'), dict) else None
+                                        maxp = bounds.get('max') if isinstance(bounds.get('max'), dict) else None
+                                    else:
+                                        minp = room.get('min') if isinstance(room.get('min'), dict) else None
+                                        maxp = room.get('max') if isinstance(room.get('max'), dict) else None
+                                    if minp and maxp:
+                                        cleaned_rooms.append({
+                                            'name': str(room.get('name') or f'Room {idx + 1}'),
+                                            'min': minp,
+                                            'max': maxp
+                                        })
+                                zdata['rooms'] = cleaned_rooms
                 
                 server_data = temp_data
             print(f"[ระบบ] โหลดข้อมูลสำเร็จ: {len(server_data)} เซิร์ฟเวอร์")
@@ -146,14 +168,22 @@ def upsert_zone(guild_id, zone_name, category_id=None, zone_range=None):
     save_data()
     return zone
 
-def set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=None, append_part=False):
+def set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=None, append_part=False, edit_part_index=None):
     zone = upsert_zone(guild_id, zone_name, zone_range=zone_range)
     new_bounds = {'min': min_point, 'max': max_point}
     parts = zone.get('parts') if isinstance(zone.get('parts'), list) else []
-    if append_part:
+    try:
+        edit_part_index = int(edit_part_index) if edit_part_index is not None else None
+    except (TypeError, ValueError):
+        edit_part_index = None
+
+    if edit_part_index is not None and 0 <= edit_part_index < len(parts):
+        parts[edit_part_index] = new_bounds
+    elif append_part:
         parts.append(new_bounds)
     else:
         parts = [new_bounds]
+
     zone['parts'] = parts
     zone['bounds'] = parts[0] if parts else new_bounds
     normalized_range = normalize_zone_range(zone_range)
@@ -161,6 +191,85 @@ def set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=None, 
         zone['range'] = normalized_range
     save_data()
     return zone
+
+def delete_zone_part(guild_id, zone_name, part_index):
+    zones = get_zone_map(guild_id)
+    zone = zones.get(zone_name)
+    if not isinstance(zone, dict):
+        return False
+    parts = zone.get('parts') if isinstance(zone.get('parts'), list) else []
+    try:
+        part_index = int(part_index)
+    except (TypeError, ValueError):
+        return False
+    if part_index < 0 or part_index >= len(parts):
+        return False
+    parts.pop(part_index)
+    zone['parts'] = parts
+    if parts:
+        zone['bounds'] = parts[0]
+    else:
+        zone.pop('bounds', None)
+    save_data()
+    return True
+
+def get_zone_rooms(guild_id, zone_name):
+    zones = get_zone_map(guild_id)
+    zone = zones.get(zone_name)
+    if not isinstance(zone, dict):
+        return []
+    rooms = zone.get('rooms')
+    if not isinstance(rooms, list):
+        rooms = []
+        zone['rooms'] = rooms
+    return rooms
+
+def set_zone_room_bounds(guild_id, zone_name, room_name, min_point, max_point, room_index=None):
+    zone = upsert_zone(guild_id, zone_name)
+    rooms = zone.get('rooms') if isinstance(zone.get('rooms'), list) else []
+    try:
+        room_index = int(room_index) if room_index is not None else None
+    except (TypeError, ValueError):
+        room_index = None
+
+    room = {
+        'name': str(room_name or '').strip() or f'Room {len(rooms) + 1}',
+        'min': min_point,
+        'max': max_point
+    }
+
+    if room_index is not None and 0 <= room_index < len(rooms):
+        old_name = str(rooms[room_index].get('name') or '').strip()
+        if old_name and not room_name:
+            room['name'] = old_name
+        rooms[room_index] = room
+    else:
+        rooms.append(room)
+
+    zone['rooms'] = rooms
+    save_data()
+    return room
+
+def delete_zone_room(guild_id, zone_name, room_index):
+    rooms = get_zone_rooms(guild_id, zone_name)
+    try:
+        room_index = int(room_index)
+    except (TypeError, ValueError):
+        return False
+    if room_index < 0 or room_index >= len(rooms):
+        return False
+    rooms.pop(room_index)
+    save_data()
+    # clear runtime session for this room index
+    guild_sessions = room_sessions.get(guild_id, {})
+    for key in list(guild_sessions.keys()):
+        try:
+            zname, idx = key.rsplit(':', 1)
+            if zname == zone_name and int(idx) == room_index:
+                del guild_sessions[key]
+        except Exception:
+            pass
+    return True
 
 def delete_zone(guild_id, zone_name):
     zones = get_zone_map(guild_id)
@@ -188,6 +297,14 @@ def find_player_zone(guild_id, point):
         for bounds in parts:
             if bounds and point_in_bounds(point, bounds):
                 return name, zone
+    return None, None
+
+def find_player_room(guild_id, zone_name, point):
+    rooms = get_zone_rooms(guild_id, zone_name)
+    for idx, room in enumerate(rooms):
+        bounds = {'min': room.get('min', {}), 'max': room.get('max', {})}
+        if point_in_bounds(point, bounds):
+            return idx, room
     return None, None
 
 
@@ -289,7 +406,12 @@ class MyBot(commands.Bot):
         app = web.Application()
         app.router.add_post('/update_coords', self.handle_coords)
         app.router.add_get('/zones', self.handle_zones)
+        app.router.add_get('/zone/parts', self.handle_zone_parts)
         app.router.add_post('/zone/bounds', self.handle_zone_bounds)
+        app.router.add_post('/zone/part/delete', self.handle_zone_part_delete)
+        app.router.add_get('/zone/rooms', self.handle_zone_rooms)
+        app.router.add_post('/zone/room/bounds', self.handle_zone_room_bounds)
+        app.router.add_post('/zone/room/delete', self.handle_zone_room_delete)
         app.router.add_post('/random/toggle', self.handle_random_toggle)
         app.router.add_get('/', self.handle_index)
         app.router.add_get('/dashboard', self.handle_dashboard)
@@ -322,10 +444,12 @@ class MyBot(commands.Bot):
                 parts = zone.get('parts') if isinstance(zone.get('parts'), list) else []
                 if not parts and isinstance(zone.get('bounds'), dict):
                     parts = [zone.get('bounds')]
+                rooms = zone.get('rooms') if isinstance(zone.get('rooms'), list) else []
                 zones.append({
                     'name': name,
                     'has_bounds': bool(parts),
                     'part_count': len(parts),
+                    'room_count': len(rooms),
                     'category_id': zone.get('category_id'),
                     'range': zone.get('range')
                 })
@@ -347,13 +471,128 @@ class MyBot(commands.Bot):
             max_point = data.get('max') or {}
             zone_range = data.get('range')
             append_part = bool(data.get('append_part', False))
+            edit_part_index = data.get('edit_part_index', None)
             if guild_id <= 0 or not zone_name:
                 return web.json_response({'status': 'error', 'message': 'invalid guild_id or zone_name'}, status=400)
             required = ['x', 'y', 'z']
             if not all(k in min_point for k in required) or not all(k in max_point for k in required):
                 return web.json_response({'status': 'error', 'message': 'invalid bounds'}, status=400)
-            zone = set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=zone_range, append_part=append_part)
+            zone = set_zone_bounds(guild_id, zone_name, min_point, max_point, zone_range=zone_range, append_part=append_part, edit_part_index=edit_part_index)
             return web.json_response({'status': 'ok', 'zone': zone})
+        except Exception as e:
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+    async def handle_zone_parts(self, request):
+        try:
+            guild_id = int(request.query.get('guild_id', '0'))
+            zone_name = str(request.query.get('zone_name') or '').strip()
+            if guild_id <= 0 or not zone_name:
+                return web.json_response({'status': 'error', 'message': 'missing guild_id or zone_name'}, status=400)
+
+            zone = get_zone_map(guild_id).get(zone_name)
+            if not isinstance(zone, dict):
+                return web.json_response({'status': 'error', 'message': 'zone not found'}, status=404)
+
+            parts = zone.get('parts') if isinstance(zone.get('parts'), list) else []
+            if not parts and isinstance(zone.get('bounds'), dict):
+                parts = [zone.get('bounds')]
+
+            return web.json_response({
+                'status': 'ok',
+                'zone_name': zone_name,
+                'parts': [
+                    {'index': idx, 'min': part.get('min', {}), 'max': part.get('max', {})}
+                    for idx, part in enumerate(parts)
+                ]
+            })
+        except Exception as e:
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+    async def handle_zone_part_delete(self, request):
+        try:
+            data = await request.json()
+            password = request.headers.get('X-Dashboard-Password', '')
+            if password and password != DASHBOARD_PASSWORD:
+                return web.json_response({'status': 'error', 'message': 'invalid password'}, status=403)
+
+            guild_id = int(data.get('guild_id') or 0)
+            zone_name = str(data.get('zone_name') or '').strip()
+            part_index = data.get('part_index')
+            ok = delete_zone_part(guild_id, zone_name, part_index)
+            if not ok:
+                return web.json_response({'status': 'error', 'message': 'part not found'}, status=404)
+            return web.json_response({'status': 'ok'})
+        except Exception as e:
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+    async def handle_zone_rooms(self, request):
+        try:
+            guild_id = int(request.query.get('guild_id', '0'))
+            zone_name = str(request.query.get('zone_name') or '').strip()
+            if guild_id <= 0 or not zone_name:
+                return web.json_response({'status': 'error', 'message': 'missing guild_id or zone_name'}, status=400)
+
+            zone = get_zone_map(guild_id).get(zone_name)
+            if not isinstance(zone, dict):
+                return web.json_response({'status': 'error', 'message': 'zone not found'}, status=404)
+
+            rooms = get_zone_rooms(guild_id, zone_name)
+            return web.json_response({
+                'status': 'ok',
+                'zone_name': zone_name,
+                'rooms': [
+                    {
+                        'index': idx,
+                        'name': room.get('name') or f'Room {idx + 1}',
+                        'has_bounds': bool(room.get('min') and room.get('max')),
+                        'min': room.get('min', {}),
+                        'max': room.get('max', {})
+                    }
+                    for idx, room in enumerate(rooms)
+                ]
+            })
+        except Exception as e:
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+    async def handle_zone_room_bounds(self, request):
+        try:
+            data = await request.json()
+            password = request.headers.get('X-Dashboard-Password', '')
+            if password and password != DASHBOARD_PASSWORD:
+                return web.json_response({'status': 'error', 'message': 'invalid password'}, status=403)
+
+            guild_id = int(data.get('guild_id') or 0)
+            zone_name = str(data.get('zone_name') or '').strip()
+            room_name = str(data.get('room_name') or '').strip()
+            room_index = data.get('room_index', None)
+            min_point = data.get('min') or {}
+            max_point = data.get('max') or {}
+
+            if guild_id <= 0 or not zone_name:
+                return web.json_response({'status': 'error', 'message': 'invalid guild_id or zone_name'}, status=400)
+            required = ['x', 'y', 'z']
+            if not all(k in min_point for k in required) or not all(k in max_point for k in required):
+                return web.json_response({'status': 'error', 'message': 'invalid bounds'}, status=400)
+
+            room = set_zone_room_bounds(guild_id, zone_name, room_name, min_point, max_point, room_index=room_index)
+            return web.json_response({'status': 'ok', 'room': room})
+        except Exception as e:
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+    async def handle_zone_room_delete(self, request):
+        try:
+            data = await request.json()
+            password = request.headers.get('X-Dashboard-Password', '')
+            if password and password != DASHBOARD_PASSWORD:
+                return web.json_response({'status': 'error', 'message': 'invalid password'}, status=403)
+
+            guild_id = int(data.get('guild_id') or 0)
+            zone_name = str(data.get('zone_name') or '').strip()
+            room_index = data.get('room_index')
+            ok = delete_zone_room(guild_id, zone_name, room_index)
+            if not ok:
+                return web.json_response({'status': 'error', 'message': 'room not found'}, status=404)
+            return web.json_response({'status': 'ok'})
         except Exception as e:
             return web.json_response({'status': 'error', 'message': str(e)}, status=500)
 
@@ -786,7 +1025,8 @@ async def zone_list_cmd(i: discord.Interaction):
         parts = zone.get('parts') if isinstance(zone.get('parts'), list) else []
         if not parts and zone.get('bounds'):
             parts = [zone.get('bounds')]
-        lines.append(f"• **{name}** → หมวด: {cat_obj.name if cat_obj else 'ไม่มีหมวด'} | parts: {len(parts)} | bounds: {'set' if parts else 'unset'} | range: {zone.get('range', 'default')}")
+        rooms = zone.get('rooms') if isinstance(zone.get('rooms'), list) else []
+        lines.append(f"• **{name}** → หมวด: {cat_obj.name if cat_obj else 'ไม่มีหมวด'} | parts: {len(parts)} | rooms: {len(rooms)} | bounds: {'set' if parts else 'unset'} | range: {zone.get('range', 'default')}")
     await i.response.send_message("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(name="zonerange")
@@ -919,6 +1159,89 @@ async def assign_groups_in_category(guild, members_with_pos, category, fallback_
                     await asyncio.sleep(0.2)
                 except:
                     pass
+
+
+async def assign_room_members(guild, members_with_pos, category, fallback_channel, taken_rooms, curr, guild_id, zone_name, room_index):
+    if not members_with_pos or not category:
+        return
+
+    members = [m for m, _, _, _ in members_with_pos if m and m.voice and m.voice.channel]
+    if not members:
+        return
+
+    guild_room_sessions = room_sessions.setdefault(guild_id, {})
+    session_key = f"{zone_name}:{room_index}"
+    session = guild_room_sessions.get(session_key, {})
+
+    member_ids = {m.id for m in members}
+    owner_id = session.get('owner_id')
+    owner = next((m for m in members if m.id == owner_id), None)
+
+    # ถ้าเจ้าของออกจาก Room ให้สุ่มโอนสิทธิ์ให้คนที่ยังอยู่
+    if owner is None:
+        owner = random.choice(members)
+        session['owner_id'] = owner.id
+
+    voice_channels = [c for c in category.channels if isinstance(c, discord.VoiceChannel)]
+    if fallback_channel and fallback_channel.category_id == category.id:
+        voice_channels = [c for c in voice_channels if c.id != fallback_channel.id]
+
+    target = None
+    old_channel_id = session.get('channel_id')
+    if old_channel_id:
+        ch = guild.get_channel(int(old_channel_id))
+        if isinstance(ch, discord.VoiceChannel) and ch.category_id == category.id and ch.id not in taken_rooms:
+            target = ch
+
+    if target is None and owner.voice and owner.voice.channel:
+        ch = owner.voice.channel
+        if ch.category_id == category.id and ch.id not in taken_rooms:
+            # ถ้าเจ้าของอยู่คนเดียว ช่องนั้นจะกลายเป็น Room โดยตรง
+            # หรือถ้ามีแต่สมาชิกที่อยู่ใน Room เดียวกัน ก็ใช้ช่องเดิมต่อได้
+            if len(ch.members) <= 1 or all((m.id in member_ids or m == guild.me) for m in ch.members):
+                target = ch
+
+    if target is None:
+        for ch in voice_channels:
+            if len(ch.members) == 0 and ch.id not in taken_rooms:
+                target = ch
+                break
+
+    if target is None:
+        for ch in voice_channels:
+            if ch.id not in taken_rooms:
+                target = ch
+                break
+
+    if target is None:
+        return
+
+    session['channel_id'] = target.id
+    guild_room_sessions[session_key] = session
+    taken_rooms.add(target.id)
+
+    for m in members:
+        if m == guild.me:
+            if guild.voice_client:
+                if guild.voice_client.channel.id != target.id:
+                    await guild.voice_client.move_to(target)
+            else:
+                try:
+                    await target.connect()
+                except:
+                    pass
+            continue
+
+        if m.voice and m.voice.channel and m.voice.channel.id != target.id:
+            if curr - user_last_move.get(m.id, 0) < MOVE_COOLDOWN:
+                continue
+            try:
+                await m.move_to(target)
+                user_last_move[m.id] = curr
+                await asyncio.sleep(0.2)
+            except:
+                pass
+
 
 async def process_voice_logic():
     curr = time.time()
@@ -1094,15 +1417,55 @@ async def process_voice_logic():
                     except:
                         pass
 
+        room_online = {}
+
         for mem, x, y, z in online:
             if mem != guild.me and mem.id in in_call_users:
                 continue
-            zone_name, zone = find_player_zone(guild_id, {'x': x, 'y': y, 'z': z})
+
+            point = {'x': x, 'y': y, 'z': z}
+            zone_name, zone = find_player_zone(guild_id, point)
             zone_category = guild.get_channel(zone.get('category_id')) if zone_name and zone and zone.get('category_id') else None
+
             if zone_name and isinstance(zone_category, discord.CategoryChannel):
-                zoned_online.setdefault(zone_name, {'category': zone_category, 'members': [], 'range': zone.get('range')})['members'].append((mem, x, y, z))
+                room_index, room = find_player_room(guild_id, zone_name, point)
+                if room_index is not None:
+                    room_key = (zone_name, room_index)
+                    room_online.setdefault(room_key, {
+                        'zone': zone,
+                        'room': room,
+                        'category': zone_category,
+                        'members': []
+                    })['members'].append((mem, x, y, z))
+                else:
+                    zoned_online.setdefault(zone_name, {
+                        'category': zone_category,
+                        'members': [],
+                        'range': zone.get('range')
+                    })['members'].append((mem, x, y, z))
             else:
                 unzoned_online.append((mem, x, y, z))
+
+        # ล้าง session ของ Room ที่ไม่มีคนอยู่แล้ว
+        active_room_keys = {f"{zone_name}:{room_index}" for (zone_name, room_index) in room_online.keys()}
+        guild_room_sessions = room_sessions.setdefault(guild_id, {})
+        for key in list(guild_room_sessions.keys()):
+            if key not in active_room_keys:
+                del guild_room_sessions[key]
+
+        # Room แยกเสียงก่อน เพื่อไม่ให้คนในโซน/นอกโซนถูกจับรวมกับคนใน Room
+        for (zone_name, room_index), room_info in room_online.items():
+            await assign_room_members(
+                guild,
+                room_info['members'],
+                room_info['category'],
+                start,
+                taken_rooms,
+                curr,
+                guild_id,
+                zone_name,
+                room_index
+            )
 
         for zone_name, zone_info in zoned_online.items():
             await assign_groups_in_category(
