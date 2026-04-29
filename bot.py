@@ -505,6 +505,108 @@ class SetupView(ui.View):
         embed.add_field(name="สถานะในเกม", value="อยู่ในเกม" if is_online else "ออฟไลน์", inline=False)
         await i.response.send_message(embed=embed, ephemeral=True)
 
+
+# --- ระบบ Backup / Restore ---
+def build_setup_embed():
+    return discord.Embed(
+        title="ระบบสนทนาด้วยเสียง (Voice Chat)",
+        description=(
+            "คำแนะนำการใช้งานอย่างละเอียด:\n"
+            "1. กดปุ่ม 'ลงทะเบียน / แก้ไขข้อมูล' ด้านล่าง\n"
+            "2. กรอกชื่อ Xbox และชื่อตัวละคร (IC) ของคุณ\n"
+            "3. เมื่อลงทะเบียนเสร็จสิ้น ให้เข้าไปรอในห้องเสียงล็อบบี้ (Lobby)\n"
+            "4. ระบบจะทำการย้ายห้องของคุณโดยอัตโนมัติเมื่อพบคุณเข้าเกม"
+        ),
+        color=0x2ecc71
+    )
+
+async def restore_registered_setup_embeds():
+    restored = 0
+    recreated = 0
+
+    try:
+        bot.add_view(SetupView())
+    except Exception:
+        pass
+
+    for gid, gdata in list(server_data.items()):
+        try:
+            guild_id = int(gid)
+        except Exception:
+            continue
+
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+
+        setup_info = gdata.get("setup_embed")
+        if not isinstance(setup_info, dict):
+            continue
+
+        channel_id = setup_info.get("channel_id")
+        if not channel_id:
+            continue
+
+        channel = guild.get_channel(int(channel_id))
+        if not channel:
+            continue
+
+        embed = build_setup_embed()
+        message_id = setup_info.get("message_id")
+
+        if message_id:
+            try:
+                msg = await channel.fetch_message(int(message_id))
+                await msg.edit(embed=embed, view=SetupView())
+                restored += 1
+                continue
+            except Exception:
+                pass
+
+        try:
+            msg = await channel.send(embed=embed, view=SetupView())
+            setup_info["channel_id"] = channel.id
+            setup_info["message_id"] = msg.id
+            gdata["setup_embed"] = setup_info
+            recreated += 1
+        except Exception:
+            pass
+
+    if recreated:
+        save_data()
+
+    return restored, recreated
+
+def make_backup_bytes():
+    save_data()
+    payload = {
+        "backup_version": 1,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "data_file": DATA_FILE,
+        "server_data": server_data
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=4).encode("utf-8")
+
+def extract_restore_payload(raw_bytes):
+    parsed = json.loads(raw_bytes.decode("utf-8-sig"))
+    if isinstance(parsed, dict) and "server_data" in parsed and isinstance(parsed["server_data"], dict):
+        return parsed["server_data"]
+    if isinstance(parsed, dict):
+        return parsed
+    raise ValueError("ไฟล์ backup ไม่ถูกต้อง: JSON ต้องเป็น object")
+
+def apply_restored_server_data(restored_raw):
+    if os.path.exists(DATA_FILE):
+        stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        shutil.copyfile(DATA_FILE, f"{DATA_FILE}.before_restore_{stamp}.bak")
+
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(restored_raw, f, ensure_ascii=False, indent=4)
+
+    load_data()
+    save_data()
+
+
 @bot.tree.command(name="setup")
 async def setup(interaction: discord.Interaction, category: discord.CategoryChannel, start_channel: discord.VoiceChannel, role: discord.Role = None):
     if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
