@@ -9,6 +9,9 @@ import random
 import json
 import time
 import sys
+import io
+import shutil
+from datetime import datetime
 from jinja2 import Environment, FileSystemLoader
 
 # --- การตั้งค่าเบื้องต้น ---
@@ -294,6 +297,11 @@ class MyBot(commands.Bot):
         app.router.add_post('/dashboard/remove', self.handle_dash_remove)
         app.router.add_post('/dashboard/toggle', self.handle_dash_toggle)
 
+        try:
+            self.add_view(SetupView())
+        except Exception as e:
+            print(f"[ระบบ] ไม่สามารถลงทะเบียน Persistent View ได้: {e}")
+
         runner = web.AppRunner(app)
         await runner.setup()
         port = int(os.environ.get("PORT", 8080))
@@ -505,9 +513,67 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
     update_whitelist(interaction.guild_id, interaction.guild.name)
     update_config(interaction.guild_id, category.id, start_channel.id, DEFAULT_RANGE)
     
-    embed = discord.Embed(title="ระบบสนทนาด้วยเสียง (Voice Chat)", description="คำแนะนำการใช้งานอย่างละเอียด:\n1. กดปุ่ม 'ลงทะเบียน / แก้ไขข้อมูล' ด้านล่าง\n2. กรอกชื่อ Xbox และชื่อตัวละคร (IC) ของคุณ\n3. เมื่อลงทะเบียนเสร็จสิ้น ให้เข้าไปรอในห้องเสียงล็อบบี้ (Lobby)\n4. ระบบจะทำการย้ายห้องของคุณโดยอัตโนมัติเมื่อพบคุณเข้าเกม", color=0x2ecc71)
-    await interaction.channel.send(embed=embed, view=SetupView())
+    embed = build_setup_embed()
+    setup_msg = await interaction.channel.send(embed=embed, view=SetupView())
+    data = get_guild_data(interaction.guild_id)
+    data['setup_embed'] = {
+        'channel_id': interaction.channel.id,
+        'message_id': setup_msg.id,
+        'category_id': category.id,
+        'start_channel_id': start_channel.id,
+        'role_id': role.id if role else None
+    }
+    save_data()
     await interaction.followup.send("ตั้งค่าระบบเสร็จสมบูรณ์", ephemeral=True)
+
+
+@bot.tree.command(name="backup")
+async def backup_data(i: discord.Interaction):
+    if not is_owner_or_admin(i):
+        return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
+
+    await i.response.defer(ephemeral=True)
+
+    try:
+        raw = make_backup_bytes()
+        stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        file = discord.File(io.BytesIO(raw), filename=f"vc_backup_{stamp}.json")
+        await i.followup.send(
+            "สำรองข้อมูลสำเร็จ ไฟล์นี้เก็บ whitelist, config, users, zones, parts หลายสี่เหลี่ยม และข้อมูล embed ลงทะเบียนที่บันทึกไว้",
+            file=file,
+            ephemeral=True
+        )
+    except Exception as e:
+        await i.followup.send(f"สำรองข้อมูลไม่สำเร็จ: {e}", ephemeral=True)
+
+@bot.tree.command(name="restore")
+async def restore_data(i: discord.Interaction, file: discord.Attachment):
+    if not is_owner_or_admin(i):
+        return await i.response.send_message("คำสั่งนี้สำหรับผู้ดูแลระบบเท่านั้น", ephemeral=True)
+
+    await i.response.defer(ephemeral=True)
+
+    try:
+        if file.size and file.size > 5 * 1024 * 1024:
+            return await i.followup.send("ไฟล์ใหญ่เกินไป จำกัดไม่เกิน 5MB", ephemeral=True)
+
+        raw = await file.read()
+        restored_raw = extract_restore_payload(raw)
+        apply_restored_server_data(restored_raw)
+
+        restored, recreated = await restore_registered_setup_embeds()
+
+        await i.followup.send(
+            "กู้คืนข้อมูลสำเร็จ\n"
+            f"- โหลดเซิร์ฟเวอร์ทั้งหมด: {len(server_data)}\n"
+            f"- ผูกปุ่ม embed เดิมกลับมา: {restored}\n"
+            f"- สร้าง embed ใหม่แทนตัวที่หาไม่เจอ: {recreated}\n"
+            "ระบบ zone, users, config และ whitelist ถูกกู้คืนจากไฟล์แล้ว",
+            ephemeral=True
+        )
+    except Exception as e:
+        await i.followup.send(f"กู้คืนข้อมูลไม่สำเร็จ: {e}", ephemeral=True)
+
 
 @bot.tree.command(name="whitelist")
 async def wl(i: discord.Interaction, server_id: str):
