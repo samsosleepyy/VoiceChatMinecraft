@@ -577,12 +577,70 @@ async def restore_registered_setup_embeds():
 
     return restored, recreated
 
+def build_registered_users_snapshot():
+    registered = []
+    for guild_id, gdata in server_data.items():
+        users = gdata.get("users", {}) if isinstance(gdata, dict) else {}
+        for user_id, udata in users.items():
+            if isinstance(udata, dict):
+                gamertag = str(udata.get("gamertag", "")).strip()
+                ic_name = str(udata.get("ic_name", gamertag)).strip()
+            else:
+                gamertag = str(udata or "").strip()
+                ic_name = gamertag
+            if not gamertag and not ic_name:
+                continue
+            registered.append({
+                "guild_id": int(guild_id),
+                "user_id": int(user_id),
+                "xbox_user_name": gamertag,
+                "gamertag": gamertag,
+                "ic_name": ic_name
+            })
+    registered.sort(key=lambda item: (item["guild_id"], item["user_id"]))
+    return registered
+
+def hydrate_registered_users_into_server_data(restored_raw, registered_users):
+    if not isinstance(restored_raw, dict) or not isinstance(registered_users, list):
+        return restored_raw
+
+    for item in registered_users:
+        if not isinstance(item, dict):
+            continue
+        try:
+            guild_id = int(item.get("guild_id"))
+            user_id = int(item.get("user_id"))
+        except (TypeError, ValueError):
+            continue
+
+        gamertag = str(item.get("xbox_user_name") or item.get("gamertag") or "").strip()
+        ic_name = str(item.get("ic_name") or gamertag).strip()
+        if not gamertag:
+            continue
+
+        guild_key = str(guild_id)
+        if guild_key not in restored_raw and guild_id not in restored_raw:
+            restored_raw[guild_key] = {"whitelist": {}, "config": {}, "users": {}, "zones": {}}
+
+        gdata = restored_raw.get(guild_key, restored_raw.get(guild_id))
+        if not isinstance(gdata, dict):
+            gdata = {"whitelist": {}, "config": {}, "users": {}, "zones": {}}
+            restored_raw[guild_key] = gdata
+
+        users = gdata.setdefault("users", {})
+        users[str(user_id)] = {"gamertag": gamertag, "ic_name": ic_name}
+
+    return restored_raw
+
 def make_backup_bytes():
     save_data()
+    registered_users = build_registered_users_snapshot()
     payload = {
-        "backup_version": 1,
+        "backup_version": 2,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "data_file": DATA_FILE,
+        "registered_users_count": len(registered_users),
+        "registered_users": registered_users,
         "server_data": server_data
     }
     return json.dumps(payload, ensure_ascii=False, indent=4).encode("utf-8")
@@ -590,8 +648,11 @@ def make_backup_bytes():
 def extract_restore_payload(raw_bytes):
     parsed = json.loads(raw_bytes.decode("utf-8-sig"))
     if isinstance(parsed, dict) and "server_data" in parsed and isinstance(parsed["server_data"], dict):
-        return parsed["server_data"]
+        restored_raw = parsed["server_data"]
+        hydrate_registered_users_into_server_data(restored_raw, parsed.get("registered_users", []))
+        return restored_raw
     if isinstance(parsed, dict):
+        hydrate_registered_users_into_server_data(parsed, parsed.get("registered_users", []))
         return parsed
     raise ValueError("ไฟล์ backup ไม่ถูกต้อง: JSON ต้องเป็น object")
 
@@ -641,7 +702,7 @@ async def backup_data(i: discord.Interaction):
         stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         file = discord.File(io.BytesIO(raw), filename=f"vc_backup_{stamp}.json")
         await i.followup.send(
-            "สำรองข้อมูลสำเร็จ ไฟล์นี้เก็บ whitelist, config, users, zones, parts หลายสี่เหลี่ยม และข้อมูล embed ลงทะเบียนที่บันทึกไว้",
+            "สำรองข้อมูลสำเร็จ ไฟล์นี้เก็บ whitelist, config, users, รายชื่อผู้ลงทะเบียน User ID/Xbox/IC, zones, parts หลายสี่เหลี่ยม และข้อมูล embed ลงทะเบียนที่บันทึกไว้",
             file=file,
             ephemeral=True
         )
@@ -670,7 +731,7 @@ async def restore_data(i: discord.Interaction, file: discord.Attachment):
             f"- โหลดเซิร์ฟเวอร์ทั้งหมด: {len(server_data)}\n"
             f"- ผูกปุ่ม embed เดิมกลับมา: {restored}\n"
             f"- สร้าง embed ใหม่แทนตัวที่หาไม่เจอ: {recreated}\n"
-            "ระบบ zone, users, config และ whitelist ถูกกู้คืนจากไฟล์แล้ว",
+            "ระบบ zone, users, รายชื่อผู้ลงทะเบียน User ID/Xbox/IC, config และ whitelist ถูกกู้คืนจากไฟล์แล้ว",
             ephemeral=True
         )
     except Exception as e:
